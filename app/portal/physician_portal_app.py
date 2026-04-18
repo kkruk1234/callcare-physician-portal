@@ -1,44 +1,158 @@
 from __future__ import annotations
 
-import os
 import json
+import os
+import secrets
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
 import psycopg
-from psycopg.rows import dict_row
-from typing import Optional
-
 import requests
-from fastapi import FastAPI, Form, HTTPException, Query
+from psycopg.rows import dict_row
+from fastapi import FastAPI, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
-
-from app.portal.portal_common import (
-    add_signed_addendum,
-    addendum_block,
-    encounter_topic,
-    encounter_when,
-    html_escape,
-    load_json,
-    load_meta,
-    packet_bundle,
-    packet_path,
-    patient_groups,
-    queue_or_send_new_note_email,
-    render_list_items,
-    render_pharmacy,
-    save_json,
-    save_meta,
-    safe_str,
-    save_note_signed,
-    signed_note_text,
-)
 
 app = FastAPI(title="CallCare Physician Portal")
 
+CALLCARE_SHARED_DATABASE_URL = os.getenv("CALLCARE_SHARED_DATABASE_URL", "").strip()
 CALLCARE_PUBLIC_BASE_URL = os.getenv("CALLCARE_PUBLIC_BASE_URL", "https://callcare.healthcare").rstrip("/")
+CALLCARE_EMAIL_PROVIDER = os.getenv("CALLCARE_EMAIL_PROVIDER", "").strip().lower()
+CALLCARE_RESEND_API_KEY = os.getenv("CALLCARE_RESEND_API_KEY", "").strip()
+CALLCARE_PHYSICIAN_USERNAME = os.getenv("CALLCARE_PHYSICIAN_USERNAME", "").strip()
+CALLCARE_PHYSICIAN_PASSWORD = os.getenv("CALLCARE_PHYSICIAN_PASSWORD", "").strip()
+
+SESSIONS: Dict[str, Dict[str, str]] = {}
 
 
-def _extract_differential_title(note_text: str, fallback: str) -> str:
+def safe_str(x: Any) -> str:
+    try:
+        return str(x if x is not None else "").strip()
+    except Exception:
+        return ""
+
+
+def html_escape(s: Any) -> str:
+    text = safe_str(s)
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def db_conn():
+    if not CALLCARE_SHARED_DATABASE_URL:
+        raise RuntimeError("CALLCARE_SHARED_DATABASE_URL is not set")
+    return psycopg.connect(CALLCARE_SHARED_DATABASE_URL, row_factory=dict_row)
+
+
+def query_all(sql: str, params: tuple = ()) -> List[Dict[str, Any]]:
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+            return [dict(r) for r in rows]
+
+
+def query_one(sql: str, params: tuple = ()) -> Optional[Dict[str, Any]]:
+    rows = query_all(sql, params)
+    return rows[0] if rows else None
+
+
+def execute(sql: str, params: tuple = ()) -> None:
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+        conn.commit()
+
+
+def make_session_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def current_session(request: Request) -> Optional[Dict[str, str]]:
+    token = request.cookies.get("callcare_physician_session", "")
+    if not token:
+        return None
+    return SESSIONS.get(token)
+
+
+def require_session(request: Request) -> Dict[str, str]:
+    sess = current_session(request)
+    if not sess:
+        raise HTTPException(status_code=401, detail="Not logged in")
+    return sess
+
+
+def signed_note_text(note_text: str, meta: Dict[str, Any]) -> str:
     text = safe_str(note_text)
+    if not meta.get("signed"):
+        return text
+    signed_at = safe_str(meta.get("signed_at"))
+    signed_by = safe_str(meta.get("signed_by"))
+    stamp = f"\n\nSigned electronically by {signed_by} on {signed_at}"
+    if stamp.strip() in text:
+        return text
+    return text + stamp
 
+
+def addendum_block(addendum: Dict[str, Any]) -> str:
+    text = safe_str(addendum.get("text"))
+    signed_at = safe_str(addendum.get("signed_at"))
+    signed_by = safe_str(addendum.get("signed_by"))
+    return f"{text}\n\nSigned addendum by {signed_by} on {signed_at}"
+
+
+def encounter_when(dt_text: str) -> str:
+    dt_text = safe_str(dt_text)
+    return dt_text.replace("T", " ").replace("+00:00", " UTC") if dt_text else ""
+
+
+def render_list_items(items: List[Dict[str, Any]], keys: List[str], empty_text: str) -> str:
+    if not items:
+        return f"<p>{html_escape(empty_text)}</p>"
+    rendered = []
+    for item in items:
+        parts = []
+        for k in keys:
+            val = safe_str(item.get(k))
+            if val:
+                parts.append(val)
+        if parts:
+            rendered.append(f"<li>{html_escape(' — '.join(parts))}</li>")
+    if not rendered:
+        return f"<p>{html_escape(empty_text)}</p>"
+    return "<ul class='detail-list'>" + "".join(rendered) + "</ul>"
+
+
+def render_pharmacy(ph: Optional[Dict[str, Any]]) -> str:
+    if not ph:
+        return "<p>No preferred pharmacy on file.</p>"
+    parts = [
+        safe_str(ph.get("name")),
+        safe_str(ph.get("address_line_1")),
+        " ".join(
+            x for x in [
+                safe_str(ph.get("city")),
+                safe_str(ph.get("state")),
+                safe_str(ph.get("postal_code")),
+            ] if x
+        ).strip(),
+        safe_str(ph.get("phone")),
+        safe_str(ph.get("fax")),
+        safe_str(ph.get("ncpdp_id")),
+    ]
+    parts = [p for p in parts if p]
+    return "<ul class='detail-list'>" + "".join(f"<li>{html_escape(p)}</li>" for p in parts) + "</ul>"
+
+
+def extract_encounter_label(note_text: str, fallback: str) -> str:
+    text = safe_str(note_text)
     lower_text = text.lower()
     marker = "the working diagnosis is "
     likely_marker = " likely"
@@ -72,218 +186,201 @@ def _extract_differential_title(note_text: str, fallback: str) -> str:
         return "Encounter"
     return f[:1].upper() + f[1:]
 
-def _shared_db_url() -> str:
-    return os.getenv("CALLCARE_SHARED_DATABASE_URL", "").strip()
 
-
-def _shared_lookup_patient_id(chart_number: str):
-    url = _shared_db_url()
-    if not url or not chart_number:
-        return None
-    with psycopg.connect(url, row_factory=dict_row) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT id::text AS patient_id FROM callcare.patients WHERE chart_number = %s LIMIT 1",
-                (chart_number,),
-            )
-            row = cur.fetchone()
-            return row["patient_id"] if row else None
-
-
-def _lookup_shared_patient_by_call_sid(call_sid: str):
-    url = _shared_db_url()
-    if not url or not call_sid:
-        return None
-    with psycopg.connect(url, row_factory=dict_row) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                  p.id::text AS patient_id,
-                  p.chart_number,
-                  e.chief_complaint
-                FROM callcare.encounters e
-                JOIN callcare.patients p
-                  ON p.id = e.patient_id
-                WHERE e.call_sid = %s
-                ORDER BY e.started_at DESC
-                LIMIT 1
-                """,
-                (call_sid,),
-            )
-            row = cur.fetchone()
-            return dict(row) if row else None
-
-
-def _sync_bundle_to_shared_db(bundle: dict) -> None:
-    url = _shared_db_url()
-    if not url or not bundle:
-        return
-
-    packet = bundle.get("packet") or {}
-    meta = bundle.get("meta") or {}
-    patient_ctx = bundle.get("patient_ctx") or {}
-
-    packet_id = safe_str(bundle.get("packet_id") or packet.get("packet_id"))
-    if not packet_id:
-        return
-
-    chart_number = safe_str(patient_ctx.get("chart_number"))
-    chief_complaint = safe_str(patient_ctx.get("chief_complaint"))
-    patient_id = safe_str(patient_ctx.get("patient_id"))
-    call_sid = safe_str(bundle.get("call_sid"))
-
-    if not call_sid:
-        try:
-            stored_meta = load_meta(packet_id)
-            call_sid = safe_str(stored_meta.get("call_sid"))
-        except Exception:
-            pass
-
-    if chart_number and not patient_id:
-        patient_id = _shared_lookup_patient_id(chart_number) or ""
-
-    if (not chart_number or not patient_id or not chief_complaint) and call_sid:
-        linked = _lookup_shared_patient_by_call_sid(call_sid)
-        if linked:
-            chart_number = chart_number or safe_str(linked.get("chart_number"))
-            patient_id = patient_id or safe_str(linked.get("patient_id"))
-            chief_complaint = chief_complaint or safe_str(linked.get("chief_complaint"))
-
-    if not chart_number or not patient_id:
-        return
-
-    spoken_summary = safe_str(bundle.get("spoken_summary"))
-
-    with psycopg.connect(url) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO callcare.portal_packets (
-                    packet_id,
-                    chart_number,
-                    patient_id,
-                    call_sid,
-                    session_id,
-                    pathway_id,
-                    created_at,
-                    chief_complaint,
-                    note_text,
-                    spoken_summary,
-                    spoken_summary_comments,
-                    status,
-                    prescription_status,
-                    note_sent,
-                    signed,
-                    signed_at,
-                    signed_by,
-                    addenda,
-                    updated_at
-                )
-                VALUES (
-                    %s,
-                    %s,
-                    %s::uuid,
-                    NULLIF(%s, ''),
-                    NULLIF(%s, ''),
-                    NULLIF(%s, ''),
-                    %s::timestamptz,
-                    NULLIF(%s, ''),
-                    NULLIF(%s, ''),
-                    COALESCE(NULLIF(%s, ''), ''),
-                    COALESCE(NULLIF(%s, ''), ''),
-                    COALESCE(NULLIF(%s, ''), 'active'),
-                    COALESCE(NULLIF(%s, ''), 'under review'),
-                    COALESCE(NULLIF(%s, ''), 'to be mailed'),
-                    %s,
-                    NULLIF(%s, '')::timestamptz,
-                    COALESCE(NULLIF(%s, ''), ''),
-                    %s::jsonb,
-                    now()
-                )
-                ON CONFLICT (packet_id) DO UPDATE
-                SET
-                    chart_number = EXCLUDED.chart_number,
-                    patient_id = EXCLUDED.patient_id,
-                    call_sid = EXCLUDED.call_sid,
-                    session_id = EXCLUDED.session_id,
-                    pathway_id = EXCLUDED.pathway_id,
-                    created_at = EXCLUDED.created_at,
-                    chief_complaint = EXCLUDED.chief_complaint,
-                    note_text = EXCLUDED.note_text,
-                    spoken_summary = EXCLUDED.spoken_summary,
-                    spoken_summary_comments = EXCLUDED.spoken_summary_comments,
-                    status = EXCLUDED.status,
-                    prescription_status = EXCLUDED.prescription_status,
-                    note_sent = EXCLUDED.note_sent,
-                    signed = EXCLUDED.signed,
-                    signed_at = EXCLUDED.signed_at,
-                    signed_by = EXCLUDED.signed_by,
-                    addenda = EXCLUDED.addenda,
-                    updated_at = now()
-                """,
-                (
-                    packet_id,
-                    chart_number,
-                    patient_id,
-                    call_sid,
-                    safe_str(packet.get("session_id")),
-                    safe_str(packet.get("pathway_id")),
-                    safe_str(packet.get("created_at")),
-                    chief_complaint,
-                    safe_str(packet.get("note_text")),
-                    spoken_summary,
-                    safe_str(meta.get("spoken_summary_comments")),
-                    safe_str(meta.get("status")),
-                    safe_str(meta.get("prescription_status")),
-                    safe_str(meta.get("note_sent")),
-                    bool(meta.get("signed")),
-                    safe_str(meta.get("signed_at")),
-                    safe_str(meta.get("signed_by")),
-                    json.dumps(meta.get("addenda") or []),
-                ),
-            )
-        conn.commit()
-
-
-def _send_email_resend(to_email: str, subject: str, body: str):
-    api_key = os.getenv("CALLCARE_RESEND_API_KEY", "").strip()
-    if not api_key:
-        return False, "Missing RESEND API key"
-
-    try:
-        resp = requests.post(
-            "https://api.resend.com/emails",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "from": "CallCare <onboarding@resend.dev>",
-                "to": [to_email],
-                "subject": subject,
-                "text": body,
-            },
-            timeout=20,
+def patient_groups() -> List[Dict[str, Any]]:
+    sql = """
+    WITH latest AS (
+      SELECT DISTINCT ON (pp.chart_number)
+        pp.chart_number,
+        pp.packet_id,
+        pp.created_at,
+        pp.chief_complaint,
+        pp.note_text,
+        pp.status,
+        pp.prescription_status,
+        pp.note_sent,
+        p.legal_first_name,
+        p.legal_last_name
+      FROM callcare.portal_packets pp
+      JOIN callcare.patients p
+        ON p.id = pp.patient_id
+      ORDER BY pp.chart_number, pp.created_at DESC
+    )
+    SELECT
+      l.chart_number,
+      trim(concat_ws(' ', l.legal_first_name, l.legal_last_name)) AS patient_name,
+      l.packet_id,
+      l.created_at::text AS created_at,
+      l.chief_complaint,
+      l.note_text,
+      l.status,
+      l.prescription_status,
+      l.note_sent
+    FROM latest l
+    ORDER BY l.created_at DESC;
+    """
+    rows = query_all(sql)
+    groups: List[Dict[str, Any]] = []
+    for row in rows:
+        groups.append(
+            {
+                "chart_number": safe_str(row.get("chart_number")),
+                "patient_name": safe_str(row.get("patient_name")),
+                "encounters": [
+                    {
+                        "packet_id": safe_str(row.get("packet_id")),
+                        "created_at": safe_str(row.get("created_at")),
+                        "packet": {
+                            "packet_id": safe_str(row.get("packet_id")),
+                            "note_text": safe_str(row.get("note_text")),
+                            "created_at": safe_str(row.get("created_at")),
+                        },
+                        "meta": {
+                            "status": safe_str(row.get("status")),
+                            "prescription_status": safe_str(row.get("prescription_status")),
+                            "note_sent": safe_str(row.get("note_sent")),
+                        },
+                        "patient_ctx": {
+                            "chart_number": safe_str(row.get("chart_number")),
+                            "patient_name": safe_str(row.get("patient_name")),
+                            "chief_complaint": safe_str(row.get("chief_complaint")),
+                        },
+                    }
+                ],
+            }
         )
-        if 200 <= resp.status_code < 300:
-            return True, None
-        return False, resp.text
-    except Exception as e:
-        return False, str(e)
+    return groups
 
 
-def _queue_or_send_new_note_email_resend(packet_id: str, patient_ctx: dict, reason: str = "note_ready"):
-    import json
-    from pathlib import Path
-    from datetime import datetime, timezone
+def get_patient_context(chart_number: str) -> Optional[Dict[str, Any]]:
+    sql = """
+    SELECT
+      p.id::text AS patient_id,
+      p.chart_number,
+      trim(concat_ws(' ', p.legal_first_name, p.legal_last_name)) AS patient_name,
+      p.date_of_birth::text AS date_of_birth,
+      p.sex_at_birth,
+      p.phone_number,
+      p.email
+    FROM callcare.patients p
+    WHERE p.chart_number = %s
+    LIMIT 1;
+    """
+    ctx = query_one(sql, (chart_number,))
+    if not ctx:
+        return None
 
-    outbox_dir = Path("logs") / "email_outbox"
-    outbox_dir.mkdir(parents=True, exist_ok=True)
+    patient_id = safe_str(ctx.get("patient_id"))
 
+    ph_sql = """
+    SELECT
+      ph.name,
+      ph.address_line_1,
+      ph.city,
+      ph.state,
+      ph.postal_code,
+      ph.phone,
+      ph.fax,
+      ph.ncpdp_id
+    FROM callcare.patient_pharmacies pp
+    JOIN callcare.pharmacies ph
+      ON ph.id = pp.pharmacy_id
+    WHERE pp.patient_id = %s::uuid
+      AND pp.is_preferred = true
+    ORDER BY ph.created_at DESC
+    LIMIT 1;
+    """
+    ctx["preferred_pharmacy"] = query_one(ph_sql, (patient_id,))
+
+    allergies_sql = """
+    SELECT allergen, reaction, severity
+    FROM callcare.patient_allergies
+    WHERE patient_id = %s::uuid
+      AND is_active = true
+    ORDER BY created_at;
+    """
+    ctx["allergies"] = query_all(allergies_sql, (patient_id,))
+
+    conditions_sql = """
+    SELECT condition_name, status
+    FROM callcare.patient_conditions
+    WHERE patient_id = %s::uuid
+    ORDER BY created_at;
+    """
+    ctx["conditions"] = query_all(conditions_sql, (patient_id,))
+
+    social_sql = """
+    SELECT domain, value_text
+    FROM callcare.patient_social_history
+    WHERE patient_id = %s::uuid
+    ORDER BY created_at;
+    """
+    ctx["social_history"] = query_all(social_sql, (patient_id,))
+
+    return ctx
+
+
+def get_encounters(chart_number: str) -> List[Dict[str, Any]]:
+    patient_ctx = get_patient_context(chart_number)
+    if not patient_ctx:
+        return []
+
+    sql = """
+    SELECT
+      packet_id,
+      chart_number,
+      created_at::text AS created_at,
+      chief_complaint,
+      note_text,
+      spoken_summary,
+      COALESCE(spoken_summary_comments, '') AS spoken_summary_comments,
+      status,
+      prescription_status,
+      note_sent,
+      signed,
+      signed_at::text AS signed_at,
+      signed_by,
+      COALESCE(addenda, '[]'::jsonb) AS addenda
+    FROM callcare.portal_packets
+    WHERE chart_number = %s
+    ORDER BY created_at DESC;
+    """
+    rows = query_all(sql, (chart_number,))
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        out.append(
+            {
+                "packet_id": safe_str(row.get("packet_id")),
+                "created_at": safe_str(row.get("created_at")),
+                "spoken_summary": safe_str(row.get("spoken_summary")),
+                "packet": {
+                    "packet_id": safe_str(row.get("packet_id")),
+                    "note_text": safe_str(row.get("note_text")),
+                    "created_at": safe_str(row.get("created_at")),
+                },
+                "meta": {
+                    "signed": bool(row.get("signed")),
+                    "signed_at": safe_str(row.get("signed_at")),
+                    "signed_by": safe_str(row.get("signed_by")),
+                    "status": safe_str(row.get("status")),
+                    "prescription_status": safe_str(row.get("prescription_status")),
+                    "note_sent": safe_str(row.get("note_sent")),
+                    "spoken_summary_comments": safe_str(row.get("spoken_summary_comments")),
+                    "addenda": row.get("addenda") or [],
+                },
+                "patient_ctx": {
+                    **patient_ctx,
+                    "chief_complaint": safe_str(row.get("chief_complaint")),
+                    "encounter_started_at": safe_str(row.get("created_at")),
+                },
+            }
+        )
+    return out
+
+
+def queue_or_send_new_note_email(packet_id: str, patient_ctx: dict, reason: str = "note_ready") -> dict:
     to_email = safe_str(patient_ctx.get("email"))
     patient_name = safe_str(patient_ctx.get("patient_name")) or "Patient"
-    chart_number = safe_str(patient_ctx.get("chart_number"))
     portal_url = f"{CALLCARE_PUBLIC_BASE_URL}/portal/login"
 
     if reason == "addendum":
@@ -332,111 +429,53 @@ def _queue_or_send_new_note_email_resend(packet_id: str, patient_ctx: dict, reas
             </p>
           </div>
         </div>
-      <script>
-        (function() {{
-          const note = document.getElementById("note_text_editor");
-          const summary = document.getElementById("spoken_summary_comments_editor");
-          const packetMatch = window.location.search.match(/packet_id=([^&]+)/);
-          const pathMatch = window.location.pathname.match(/\/packet\/([^/]+)/);
-          const packetId = packetMatch ? decodeURIComponent(packetMatch[1]) : (pathMatch ? decodeURIComponent(pathMatch[1]) : "");
-          if (!packetId) return;
-
-          const noteKey = "callcare_note_draft_" + packetId;
-          const summaryKey = "callcare_summary_draft_" + packetId;
-
-          if (note) {{
-            const savedNote = localStorage.getItem(noteKey);
-            if (savedNote !== null) note.value = savedNote;
-            note.addEventListener("input", function() {{
-              localStorage.setItem(noteKey, note.value);
-            }});
-            const noteForm = note.closest("form");
-            if (noteForm) {{
-              noteForm.addEventListener("submit", function() {{
-                localStorage.removeItem(noteKey);
-              }});
-            }}
-          }}
-
-          if (summary) {{
-            const savedSummary = localStorage.getItem(summaryKey);
-            if (savedSummary !== null) summary.value = savedSummary;
-            summary.addEventListener("input", function() {{
-              localStorage.setItem(summaryKey, summary.value);
-            }});
-            const summaryForm = summary.closest("form");
-            if (summaryForm) {{
-              summaryForm.addEventListener("submit", function() {{
-                localStorage.removeItem(summaryKey);
-              }});
-            }}
-          }}
-        }})();
-      </script>
       </body>
     </html>
     """
 
-    payload = {
-        "queued_at": datetime.now(timezone.utc).isoformat(),
-        "to_email": to_email,
-        "patient_name": patient_name,
-        "chart_number": chart_number,
-        "packet_id": packet_id,
-        "subject": subject,
-        "body": plain,
-        "html_body": html_body,
-        "reason": reason,
-        "sent": False,
-        "send_method": "queued_only",
-    }
+    payload = {"sent": False}
 
     if not to_email:
         payload["error"] = "No patient email on file"
-    else:
-        provider = os.getenv("CALLCARE_EMAIL_PROVIDER", "").strip().lower()
-        if provider == "resend":
-            api_key = os.getenv("CALLCARE_RESEND_API_KEY", "").strip()
-            if not api_key:
-                payload["error"] = "Missing RESEND API key"
-            else:
-                try:
-                    resp = requests.post(
-                        "https://api.resend.com/emails",
-                        headers={
-                            "Authorization": f"Bearer {api_key}",
-                            "Content-Type": "application/json",
-                        },
-                        json={
-                            "from": "CallCare <onboarding@resend.dev>",
-                            "to": [to_email],
-                            "subject": subject,
-                            "text": plain,
-                            "html": html_body,
-                        },
-                        timeout=20,
-                    )
-                    if 200 <= resp.status_code < 300:
-                        payload["sent"] = True
-                        payload["send_method"] = "resend"
-                    else:
-                        payload["error"] = safe_str(resp.text)
-                except Exception as e:
-                    payload["error"] = safe_str(e)
-        else:
-            result = queue_or_send_new_note_email(patient_ctx, chart_number, packet_id)
-            payload.update(result)
+        return payload
 
-    outbox_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{packet_id}.json"
-    outbox_path = outbox_dir / outbox_name
-    outbox_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    if CALLCARE_EMAIL_PROVIDER == "resend":
+        if not CALLCARE_RESEND_API_KEY:
+            payload["error"] = "Missing RESEND API key"
+            return payload
+        try:
+            resp = requests.post(
+                "https://api.resend.com/emails",
+                headers={
+                    "Authorization": f"Bearer {CALLCARE_RESEND_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "from": "CallCare <onboarding@resend.dev>",
+                    "to": [to_email],
+                    "subject": subject,
+                    "text": plain,
+                    "html": html_body,
+                },
+                timeout=20,
+            )
+            if 200 <= resp.status_code < 300:
+                payload["sent"] = True
+            else:
+                payload["error"] = safe_str(resp.text)
+        except Exception as e:
+            payload["error"] = safe_str(e)
+    else:
+        payload["error"] = "Unsupported email provider"
     return payload
 
+
 def shell(title: str, body: str) -> str:
-    return f"""
+    template = """
     <html>
       <head>
-        <title>{html_escape(title)}</title>
+        <title>{title}</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
         <style>
           :root {{
             --bg: #f3f8f7;
@@ -561,13 +600,17 @@ def shell(title: str, body: str) -> str:
             cursor: pointer;
             box-shadow: 0 8px 18px rgba(29,143,138,0.18);
           }}
-          .btn-soft {{
-            background: #eef8f7;
-            color: var(--ink);
-            border: 1px solid var(--line);
-            box-shadow: none;
-          }}
           .detail-list {{ margin: 0; padding-left: 18px; }}
+          .login-card {{ max-width: 520px; margin: 80px auto 0 auto; }}
+          input {{
+            width: 100%;
+            padding: 12px;
+            border-radius: 12px;
+            border: 1px solid var(--line);
+            margin-top: 6px;
+            background: rgba(255,255,255,0.97);
+          }}
+          label {{ display: block; margin-top: 12px; font-weight: 700; }}
           @media (max-width: 980px) {{
             .layout {{ grid-template-columns: 1fr; }}
           }}
@@ -577,9 +620,50 @@ def shell(title: str, body: str) -> str:
         <div class="wrap">
           {body}
         </div>
+        <script>
+          (function() {{
+            const note = document.getElementById("note_text_editor");
+            const summary = document.getElementById("spoken_summary_comments_editor");
+            const packetInput = document.getElementById("current_packet_id");
+            const packetId = packetInput ? packetInput.value : "";
+            if (!packetId) return;
+
+            const noteKey = "callcare_note_draft_" + packetId;
+            const summaryKey = "callcare_summary_draft_" + packetId;
+
+            if (note) {{
+              const savedNote = localStorage.getItem(noteKey);
+              if (savedNote !== null) note.value = savedNote;
+              note.addEventListener("input", function() {{
+                localStorage.setItem(noteKey, note.value);
+              }});
+              const noteForm = note.closest("form");
+              if (noteForm) {{
+                noteForm.addEventListener("submit", function() {{
+                  localStorage.removeItem(noteKey);
+                }});
+              }}
+            }}
+
+            if (summary) {{
+              const savedSummary = localStorage.getItem(summaryKey);
+              if (savedSummary !== null) summary.value = savedSummary;
+              summary.addEventListener("input", function() {{
+                localStorage.setItem(summaryKey, summary.value);
+              }});
+              const summaryForm = summary.closest("form");
+              if (summaryForm) {{
+                summaryForm.addEventListener("submit", function() {{
+                  localStorage.removeItem(summaryKey);
+                }});
+              }}
+            }}
+          }})();
+        </script>
       </body>
     </html>
     """
+    return template.format(title=html_escape(title), body=body)
 
 
 @app.get("/healthz")
@@ -587,28 +671,59 @@ async def healthz() -> PlainTextResponse:
     return PlainTextResponse("ok")
 
 
-@app.get("/packet/{packet_id}", response_class=HTMLResponse)
-async def legacy_packet_redirect(packet_id: str) -> RedirectResponse:
-    path = packet_path(packet_id)
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Packet not found")
+@app.get("/login", response_class=HTMLResponse)
+async def login_page() -> str:
+    return shell(
+        "CallCare Physician Login",
+        """
+        <div class="hero">
+          <h1>CallCare Physician Portal</h1>
+          <p>Secure physician access</p>
+        </div>
 
-    bundle = packet_bundle(path)
-    if not bundle:
-        raise HTTPException(status_code=404, detail="Packet bundle not found")
-
-    chart_number = safe_str((bundle.get("patient_ctx") or {}).get("chart_number"))
-    if not chart_number:
-        raise HTTPException(status_code=404, detail="Patient chart not linked")
-
-    return RedirectResponse(
-        url=f"/patient/{chart_number}?packet_id={packet_id}&tab=encounters",
-        status_code=303,
+        <div class="card login-card">
+          <h2 style="margin-top:0;">Log In</h2>
+          <form method="post" action="/login" autocomplete="off">
+            <label>Username</label>
+            <input name="username" />
+            <label>Password</label>
+            <input name="password" type="password" />
+            <div class="btnbar">
+              <button type="submit">Log In</button>
+            </div>
+          </form>
+        </div>
+        """,
     )
 
 
+@app.post("/login")
+async def login(username: str = Form(...), password: str = Form(...)) -> RedirectResponse:
+    if not CALLCARE_PHYSICIAN_USERNAME or not CALLCARE_PHYSICIAN_PASSWORD:
+        raise HTTPException(status_code=500, detail="Physician credentials are not configured")
+    if username != CALLCARE_PHYSICIAN_USERNAME or password != CALLCARE_PHYSICIAN_PASSWORD:
+        return RedirectResponse(url="/login", status_code=303)
+
+    token = make_session_token()
+    SESSIONS[token] = {"username": username, "created_at": now_iso()}
+    response = RedirectResponse(url="/", status_code=303)
+    response.set_cookie("callcare_physician_session", token, httponly=True, samesite="lax", secure=True, path="/")
+    return response
+
+
+@app.get("/logout")
+async def logout(request: Request) -> RedirectResponse:
+    token = request.cookies.get("callcare_physician_session", "")
+    if token and token in SESSIONS:
+        del SESSIONS[token]
+    response = RedirectResponse(url="/login", status_code=303)
+    response.delete_cookie("callcare_physician_session", path="/")
+    return response
+
+
 @app.get("/", response_class=HTMLResponse)
-async def home() -> str:
+async def home(request: Request) -> str:
+    require_session(request)
     groups = patient_groups()
 
     if not groups:
@@ -619,20 +734,26 @@ async def home() -> str:
               <h1>CallCare Physician Portal</h1>
               <p>No routed review packets yet.</p>
             </div>
+            <p><a href="/logout">Log out</a></p>
             """,
         )
 
     rows = []
     for g in groups:
         latest = g["encounters"][0]
-        meta = latest["meta"]
         patient_ctx = latest["patient_ctx"] or {}
+        packet = latest["packet"] or {}
+        meta = latest["meta"] or {}
+        label = extract_encounter_label(
+            safe_str(packet.get("note_text")),
+            safe_str(patient_ctx.get("chief_complaint")),
+        )
         rows.append(
             f"<tr>"
             f"<td><a href='/patient/{html_escape(g['chart_number'])}'>{html_escape(g['patient_name'])}</a></td>"
             f"<td>{html_escape(g['chart_number'])}</td>"
-            f"<td>{len(g['encounters'])}</td>"
-            f"<td>{html_escape(safe_str((patient_ctx or {}).get('chief_complaint')))}</td>"
+            f"<td>{html_escape(label)}</td>"
+            f"<td>{html_escape(encounter_when(safe_str(latest.get('created_at'))))}</td>"
             f"<td>{html_escape(safe_str(meta.get('status')))}</td>"
             f"<td>{html_escape(safe_str(meta.get('prescription_status')))}</td>"
             f"</tr>"
@@ -643,8 +764,10 @@ async def home() -> str:
         f"""
         <div class="hero">
           <h1>CallCare Physician Portal</h1>
-          <p>Physician review queue with linked patient charts, signed notes, addenda, and delivery tracking.</p>
+          <p>Physician review workspace</p>
         </div>
+
+        <p><a href="/logout">Log out</a></p>
 
         <div class="card list-card">
           <table>
@@ -652,8 +775,8 @@ async def home() -> str:
               <tr>
                 <th>Patient</th>
                 <th>Chart #</th>
-                <th>Encounters</th>
-                <th>Latest Chief Complaint</th>
+                <th>Encounter</th>
+                <th>Date / Time</th>
                 <th>Status</th>
                 <th>Prescription</th>
               </tr>
@@ -670,43 +793,45 @@ async def home() -> str:
 @app.get("/patient/{chart_number}", response_class=HTMLResponse)
 async def patient_chart(
     chart_number: str,
+    request: Request,
     packet_id: Optional[str] = Query(default=None),
     tab: str = Query(default="encounters"),
 ) -> str:
-    groups = patient_groups()
-    group = next((g for g in groups if g["chart_number"] == chart_number), None)
-    if not group:
+    require_session(request)
+
+    patient_ctx = get_patient_context(chart_number)
+    if not patient_ctx:
         raise HTTPException(status_code=404, detail="Patient chart not found")
 
-    patient_ctx = group["patient_ctx"] or {}
-    encounters = group["encounters"]
+    encounters = get_encounters(chart_number)
+    if not encounters:
+        raise HTTPException(status_code=404, detail="No encounters found")
 
     selected_bundle = None
     if packet_id:
-        selected_bundle = next((e for e in encounters if e["packet_id"] == packet_id), None)
-    if not selected_bundle and encounters:
+        for enc in encounters:
+            if safe_str(enc.get("packet_id")) == safe_str(packet_id):
+                selected_bundle = enc
+                break
+    if not selected_bundle:
         selected_bundle = encounters[0]
 
-    if not selected_bundle:
-        raise HTTPException(status_code=404, detail="No encounters found")
-
-    selected_packet_id = selected_bundle["packet_id"]
-    selected_packet = selected_bundle["packet"]
-    selected_meta = selected_bundle["meta"]
+    selected_packet_id = safe_str(selected_bundle.get("packet_id"))
+    selected_packet = selected_bundle.get("packet") or {}
+    selected_meta = selected_bundle.get("meta") or {}
     selected_note = safe_str(selected_packet.get("note_text"))
     selected_signed_note = signed_note_text(selected_note, selected_meta)
-    selected_spoken_summary = selected_bundle["spoken_summary"]
-
-    if safe_str(selected_meta.get("status")) == "active":
-        selected_meta["status"] = "under review"
-        save_meta(selected_packet_id, selected_meta)
+    selected_spoken_summary = safe_str(selected_bundle.get("spoken_summary"))
 
     encounter_tab_links = []
-    for idx, enc in enumerate(encounters, 1):
+    for enc in encounters:
         enc_ctx = enc.get("patient_ctx") or {}
-        label = _extract_differential_title(safe_str((enc.get("packet") or {}).get("note_text")), safe_str(enc_ctx.get("chief_complaint")))
-        started = encounter_when(safe_str(enc_ctx.get("encounter_started_at")), safe_str(enc.get("created_at")))
-        active_class = "enc-link active" if enc["packet_id"] == selected_packet_id else "enc-link"
+        label = extract_encounter_label(
+            safe_str((enc.get("packet") or {}).get("note_text")),
+            safe_str(enc_ctx.get("chief_complaint")),
+        )
+        started = encounter_when(safe_str(enc_ctx.get("encounter_started_at")) or safe_str(enc.get("created_at")))
+        active_class = "enc-link active" if safe_str(enc.get("packet_id")) == selected_packet_id else "enc-link"
         encounter_tab_links.append(
             f"<li><a class='{active_class}' href='/patient/{html_escape(chart_number)}?packet_id={html_escape(enc['packet_id'])}&tab=encounters'>{html_escape(label)} — {html_escape(started)}</a></li>"
         )
@@ -727,7 +852,7 @@ async def patient_chart(
         ["domain", "value_text"],
         "No social history on file.",
     )
-    pharmacy_html = render_pharmacy(patient_ctx.get("preferred_pharmacy") or {})
+    pharmacy_html = render_pharmacy(patient_ctx.get("preferred_pharmacy"))
 
     demographics_panel = f"""
       <div class="card">
@@ -768,12 +893,14 @@ async def patient_chart(
     note_editor_html = (
         f"""
         <form method="post" action="/packet/{html_escape(selected_packet_id)}/update-note">
+          <input type="hidden" id="current_packet_id" value="{html_escape(selected_packet_id)}" />
           <textarea id="note_text_editor" name="note_text">{html_escape(selected_note)}</textarea>
           <p class="btnbar"><button type="submit">Save Note Changes</button></p>
         </form>
         """
         if not selected_meta.get("signed")
         else f"""
+        <input type="hidden" id="current_packet_id" value="{html_escape(selected_packet_id)}" />
         <div class="readonly">{html_escape(selected_signed_note)}</div>
         <p><em>Signed notes are read-only.</em></p>
         """
@@ -801,6 +928,35 @@ async def patient_chart(
         else ""
     )
 
+    summary_editor = (
+        f"""
+        <form method="post" action="/packet/{html_escape(selected_packet_id)}/update-spoken-summary-comments">
+          <textarea id="spoken_summary_comments_editor" name="spoken_summary_comments" style="min-height:180px;">{html_escape(selected_meta.get("spoken_summary_comments"))}</textarea>
+          <p class="btnbar"><button type="submit">Save Spoken Summary Comments</button></p>
+        </form>
+        """
+        if not selected_meta.get("signed")
+        else f"""
+        <div class="readonly">{html_escape(selected_meta.get("spoken_summary_comments") or "No physician comments on spoken summary.")}</div>
+        <p><em>Signed notes lock spoken-summary comments. Use an addendum for later changes.</em></p>
+        """
+    )
+
+    physician_actions = f"""
+      <div class="card">
+        <h2 class="section-title">Physician Actions</h2>
+        <div class="btnbar">
+          {'' if selected_meta.get("signed") else f'<form method="post" action="/packet/{html_escape(selected_packet_id)}/sign"><button type="submit">Sign Note</button></form>'}
+          <form method="post" action="/packet/{html_escape(selected_packet_id)}/prescribe">
+            <button type="submit">Send Prescription</button>
+          </form>
+          <form method="post" action="/packet/{html_escape(selected_packet_id)}/note-sent/to-be-mailed">
+            <button type="submit">Mark Note To Be Mailed</button>
+          </form>
+        </div>
+      </div>
+    """
+
     encounter_panel = f"""
       <div class="card">
         <h2 class="section-title">{html_escape(patient_ctx.get('patient_name'))}</h2>
@@ -816,12 +972,6 @@ async def patient_chart(
 
         <p class="pill">Prescription: {html_escape(selected_meta.get('prescription_status'))}</p>
         <p class="pill">Delivery: {html_escape(selected_meta.get('note_sent'))}</p>
-
-        <div class="btnbar">
-          <form method="get" action="/packet/{html_escape(selected_packet_id)}/full-text">
-            <button class="btn-soft" type="submit">Full Transcript</button>
-          </form>
-        </div>
       </div>
 
       <div class="card">
@@ -834,29 +984,12 @@ async def patient_chart(
         <div class="readonly">{html_escape(selected_spoken_summary or 'No spoken summary available.')}</div>
 
         <h3 style="margin-top:18px;">Physician's Comments on Spoken Summary</h3>
-        {(
-          f'<div class="readonly">{html_escape(selected_meta.get("spoken_summary_comments") or "No physician comments on spoken summary.")}</div><p><em>Signed notes lock spoken-summary comments. Use an addendum for any later changes.</em></p>'
-          if selected_meta.get("signed")
-          else
-          f'<form method="post" action="/packet/{html_escape(selected_packet_id)}/update-spoken-summary-comments"><textarea id="spoken_summary_comments_editor" name="spoken_summary_comments" style="min-height:180px;">{html_escape(selected_meta.get("spoken_summary_comments"))}</textarea><p class="btnbar"><button type="submit">Save Spoken Summary Comments</button></p></form>'
-        )}
+        {summary_editor}
       </div>
 
       {addenda_html}
       {addendum_editor_html}
-
-      <div class="card">
-        <h2 class="section-title">Physician Actions</h2>
-        <div class="btnbar">
-          {'' if selected_meta.get("signed") else f'<form method="post" action="/packet/{html_escape(selected_packet_id)}/sign"><button type="submit">Sign Note</button></form>'}
-          <form method="post" action="/packet/{html_escape(selected_packet_id)}/prescribe">
-            <button type="submit">Send Prescription</button>
-          </form>
-          <form method="post" action="/packet/{html_escape(selected_packet_id)}/note-sent/to-be-mailed">
-            <button type="submit">Mark Note To Be Mailed</button>
-          </form>
-        </div>
-      </div>
+      {physician_actions}
     """
 
     panel_html = {
@@ -872,8 +1005,6 @@ async def patient_chart(
             f"<a class='{active}' href='/patient/{html_escape(chart_number)}?packet_id={html_escape(selected_packet_id)}&tab={html_escape(tab_name)}'>{html_escape(label)}</a>"
         )
 
-    _sync_bundle_to_shared_db(selected_bundle)
-
     return shell(
         f"{safe_str(patient_ctx.get('patient_name'))} - CallCare Physician Portal",
         f"""
@@ -882,7 +1013,7 @@ async def patient_chart(
           <p>Chart #{html_escape(patient_ctx.get('chart_number'))} · Physician review workspace</p>
         </div>
 
-        <p><a href="/">← Back to patient list</a></p>
+        <p><a href="/">← Back to patient list</a> | <a href="/logout">Log out</a></p>
 
         <div class="tabs">
           {tab_link("demographics", "Demographics + Pharmacy")}
@@ -904,169 +1035,117 @@ async def patient_chart(
     )
 
 
-@app.get("/packet/{packet_id}/full-text", response_class=HTMLResponse)
-async def full_text(packet_id: str) -> str:
-    path = packet_path(packet_id)
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Packet not found")
-
-    bundle = packet_bundle(path)
-    if not bundle:
-        raise HTTPException(status_code=404, detail="Packet bundle not found")
-
-    call_log = bundle["call_log"]
-    transcript = call_log.get("transcript", []) if isinstance(call_log, dict) else []
-
-    transcript_html = ""
-    for turn in transcript:
-        role = html_escape(turn.get("role"))
-        text = html_escape(turn.get("text"))
-        transcript_html += f"<p><strong>{role}:</strong> {text}</p>"
-
-    if not transcript_html:
-        transcript_html = "<p>No call transcript available for this packet.</p>"
-
-    patient_ctx = bundle.get("patient_ctx") or {}
-    chart_number = safe_str(patient_ctx.get("chart_number"))
-    back_url = f"/patient/{chart_number}?packet_id={html_escape(bundle['packet_id'])}&tab=encounters" if chart_number else "/"
-
-    return shell(
-        f"Full Transcript {packet_id}",
-        f"""
-        <div class="hero">
-          <h1>Full Transcript</h1>
-          <p>Packet {html_escape(packet_id)}</p>
-        </div>
-        <p><a href="{back_url}">← Back to encounter</a></p>
-        <div class="card">{transcript_html}</div>
-        """,
-    )
-
-
 @app.post("/packet/{packet_id}/update-note")
-async def update_note(packet_id: str, note_text: str = Form(...)) -> RedirectResponse:
-    path = packet_path(packet_id)
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Packet not found")
+async def update_note(packet_id: str, request: Request, note_text: str = Form(...)) -> RedirectResponse:
+    require_session(request)
 
-    meta = load_meta(packet_id)
-    if meta.get("signed"):
+    row = query_one("SELECT chart_number, signed FROM callcare.portal_packets WHERE packet_id = %s LIMIT 1;", (packet_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="Packet not found")
+    if row.get("signed"):
         raise HTTPException(status_code=400, detail="Signed notes are read-only")
 
-    d = load_json(path)
-    d["note_text"] = safe_str(note_text)
-    save_json(path, d)
-
-    bundle = packet_bundle(path)
-    if bundle:
-        _sync_bundle_to_shared_db(bundle)
-        patient_ctx = bundle.get("patient_ctx") or {}
-        _queue_or_send_new_note_email_resend(packet_id, patient_ctx)
-    chart_number = safe_str((bundle.get("patient_ctx") or {}).get("chart_number")) if bundle else ""
+    chart_number = safe_str(row.get("chart_number"))
+    execute(
+        "UPDATE callcare.portal_packets SET note_text = %s, updated_at = now() WHERE packet_id = %s;",
+        (safe_str(note_text), packet_id),
+    )
     return RedirectResponse(url=f"/patient/{chart_number}?packet_id={packet_id}&tab=encounters", status_code=303)
 
 
 @app.post("/packet/{packet_id}/update-spoken-summary-comments")
-async def update_spoken_summary_comments(packet_id: str, spoken_summary_comments: str = Form(...)) -> RedirectResponse:
-    path = packet_path(packet_id)
-    if not path.exists():
+async def update_summary_comments(packet_id: str, request: Request, spoken_summary_comments: str = Form(...)) -> RedirectResponse:
+    require_session(request)
+
+    row = query_one("SELECT chart_number, signed FROM callcare.portal_packets WHERE packet_id = %s LIMIT 1;", (packet_id,))
+    if not row:
         raise HTTPException(status_code=404, detail="Packet not found")
+    if row.get("signed"):
+        raise HTTPException(status_code=400, detail="Signed notes lock spoken-summary comments")
 
-    meta = load_meta(packet_id)
-    meta["spoken_summary_comments"] = safe_str(spoken_summary_comments)
-    save_meta(packet_id, meta)
-
-    bundle = packet_bundle(path)
-    if bundle:
-        _sync_bundle_to_shared_db(bundle)
-        patient_ctx = bundle.get("patient_ctx") or {}
-        _queue_or_send_new_note_email_resend(packet_id, patient_ctx)
-    chart_number = safe_str((bundle.get("patient_ctx") or {}).get("chart_number")) if bundle else ""
+    chart_number = safe_str(row.get("chart_number"))
+    execute(
+        "UPDATE callcare.portal_packets SET spoken_summary_comments = %s, updated_at = now() WHERE packet_id = %s;",
+        (safe_str(spoken_summary_comments), packet_id),
+    )
     return RedirectResponse(url=f"/patient/{chart_number}?packet_id={packet_id}&tab=encounters", status_code=303)
 
 
 @app.post("/packet/{packet_id}/sign")
-async def sign_note(packet_id: str) -> RedirectResponse:
-    path = packet_path(packet_id)
-    if not path.exists():
+async def sign_note(packet_id: str, request: Request) -> RedirectResponse:
+    require_session(request)
+
+    row = query_one("SELECT chart_number FROM callcare.portal_packets WHERE packet_id = %s LIMIT 1;", (packet_id,))
+    if not row:
         raise HTTPException(status_code=404, detail="Packet not found")
 
-    save_note_signed(packet_id)
-
-    bundle = packet_bundle(path)
-    if bundle:
-        _sync_bundle_to_shared_db(bundle)
-        patient_ctx = bundle.get("patient_ctx") or {}
-        _queue_or_send_new_note_email_resend(packet_id, patient_ctx, reason="note_ready")
-    chart_number = safe_str((bundle.get("patient_ctx") or {}).get("chart_number")) if bundle else ""
+    chart_number = safe_str(row.get("chart_number"))
+    execute(
+        "UPDATE callcare.portal_packets SET signed = true, signed_at = now(), signed_by = 'Physician', status = 'completed', updated_at = now() WHERE packet_id = %s;",
+        (packet_id,),
+    )
+    patient_ctx = get_patient_context(chart_number) or {}
+    queue_or_send_new_note_email(packet_id, patient_ctx, reason="note_ready")
     return RedirectResponse(url=f"/patient/{chart_number}?packet_id={packet_id}&tab=encounters", status_code=303)
 
 
 @app.post("/packet/{packet_id}/addendum")
-async def sign_addendum(packet_id: str, addendum_text: str = Form(...)) -> RedirectResponse:
-    path = packet_path(packet_id)
-    if not path.exists():
+async def sign_addendum_route(packet_id: str, request: Request, addendum_text: str = Form(...)) -> RedirectResponse:
+    require_session(request)
+
+    row = query_one("SELECT chart_number, signed, COALESCE(addenda, '[]'::jsonb) AS addenda FROM callcare.portal_packets WHERE packet_id = %s LIMIT 1;", (packet_id,))
+    if not row:
         raise HTTPException(status_code=404, detail="Packet not found")
-
-    meta = load_meta(packet_id)
-    if not meta.get("signed"):
+    if not row.get("signed"):
         raise HTTPException(status_code=400, detail="Note must be signed before addenda can be added")
-
     if not safe_str(addendum_text):
         raise HTTPException(status_code=400, detail="Addendum text is required")
 
-    add_signed_addendum(packet_id, addendum_text)
-
-    bundle = packet_bundle(path)
-    if bundle:
-        _sync_bundle_to_shared_db(bundle)
-        patient_ctx = bundle.get("patient_ctx") or {}
-        _queue_or_send_new_note_email_resend(packet_id, patient_ctx, reason="addendum")
-    chart_number = safe_str((bundle.get("patient_ctx") or {}).get("chart_number")) if bundle else ""
+    chart_number = safe_str(row.get("chart_number"))
+    addenda = row.get("addenda") or []
+    addenda.append(
+        {
+            "text": safe_str(addendum_text),
+            "signed_at": now_iso(),
+            "signed_by": "Physician",
+        }
+    )
+    execute(
+        "UPDATE callcare.portal_packets SET addenda = %s::jsonb, updated_at = now() WHERE packet_id = %s;",
+        (json.dumps(addenda), packet_id),
+    )
+    patient_ctx = get_patient_context(chart_number) or {}
+    queue_or_send_new_note_email(packet_id, patient_ctx, reason="addendum")
     return RedirectResponse(url=f"/patient/{chart_number}?packet_id={packet_id}&tab=encounters", status_code=303)
 
 
 @app.post("/packet/{packet_id}/prescribe")
-async def send_prescription(packet_id: str) -> RedirectResponse:
-    path = packet_path(packet_id)
-    if not path.exists():
+async def prescribe(packet_id: str, request: Request) -> RedirectResponse:
+    require_session(request)
+
+    row = query_one("SELECT chart_number FROM callcare.portal_packets WHERE packet_id = %s LIMIT 1;", (packet_id,))
+    if not row:
         raise HTTPException(status_code=404, detail="Packet not found")
 
-    meta = load_meta(packet_id)
-    meta["prescription_status"] = "sent"
-    save_meta(packet_id, meta)
-
-    bundle = packet_bundle(path)
-    if bundle:
-        _sync_bundle_to_shared_db(bundle)
-        patient_ctx = bundle.get("patient_ctx") or {}
-        _queue_or_send_new_note_email_resend(packet_id, patient_ctx)
-    chart_number = safe_str((bundle.get("patient_ctx") or {}).get("chart_number")) if bundle else ""
+    chart_number = safe_str(row.get("chart_number"))
+    execute(
+        "UPDATE callcare.portal_packets SET prescription_status = 'sent', updated_at = now() WHERE packet_id = %s;",
+        (packet_id,),
+    )
     return RedirectResponse(url=f"/patient/{chart_number}?packet_id={packet_id}&tab=encounters", status_code=303)
 
 
-@app.post("/packet/{packet_id}/note-sent/{mode}")
-async def note_sent(packet_id: str, mode: str) -> RedirectResponse:
-    path = packet_path(packet_id)
-    if not path.exists():
+@app.post("/packet/{packet_id}/note-sent/to-be-mailed")
+async def note_to_be_mailed(packet_id: str, request: Request) -> RedirectResponse:
+    require_session(request)
+
+    row = query_one("SELECT chart_number FROM callcare.portal_packets WHERE packet_id = %s LIMIT 1;", (packet_id,))
+    if not row:
         raise HTTPException(status_code=404, detail="Packet not found")
 
-    normalized = safe_str(mode).lower()
-    if normalized not in {"emailed", "to-be-mailed", "to_be_mailed", "to be mailed"}:
-        raise HTTPException(status_code=400, detail="Invalid note-sent mode")
-
-    meta = load_meta(packet_id)
-    bundle = packet_bundle(path)
-
-    if normalized == "emailed":
-        patient_ctx = (bundle or {}).get("patient_ctx") or {}
-        result = _queue_or_send_new_note_email_resend(packet_id, patient_ctx)
-        meta["note_sent"] = "emailed"
-        meta["email_last_queued_at"] = safe_str(result.get("queued_at"))
-    else:
-        meta["note_sent"] = "to be mailed"
-
-    save_meta(packet_id, meta)
-
-    chart_number = safe_str(((bundle or {}).get("patient_ctx") or {}).get("chart_number"))
+    chart_number = safe_str(row.get("chart_number"))
+    execute(
+        "UPDATE callcare.portal_packets SET note_sent = 'to be mailed', updated_at = now() WHERE packet_id = %s;",
+        (packet_id,),
+    )
     return RedirectResponse(url=f"/patient/{chart_number}?packet_id={packet_id}&tab=encounters", status_code=303)
