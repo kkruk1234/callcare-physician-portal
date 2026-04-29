@@ -991,7 +991,7 @@ async def patient_chart(
           <div class="metric"><div class="label">Date of Birth</div><div class="value">{html_escape(patient_ctx.get('date_of_birth'))}</div></div>
           <div class="metric"><div class="label">Sex at Birth</div><div class="value">{html_escape(patient_ctx.get('sex_at_birth'))}</div></div>
           <div class="metric"><div class="label">Chief Complaint</div><div class="value">{html_escape((selected_bundle.get('patient_ctx') or {}).get('chief_complaint'))}</div></div>
-          <div class="metric"><div class="label">Encounter Started</div><div class="value">{html_escape(_format_portal_time((selected_bundle.get('patient_ctx') or {}).get('encounter_started_at') or selected_bundle.get('created_at')))}</div></div>
+          <div class="metric"><div class="label">Encounter Started</div><div class="value">{html_escape((selected_bundle.get('patient_ctx') or {}).get('encounter_started_at') or selected_bundle.get('created_at'))}</div></div>
           <div class="metric"><div class="label">Status</div><div class="value">{html_escape(selected_meta.get('status'))}</div></div>
         </div>
 
@@ -1097,50 +1097,20 @@ async def update_summary_comments(packet_id: str, request: Request, spoken_summa
 
 
 @app.post("/packet/{packet_id}/sign")
-async def sign_note(packet_id: str) -> RedirectResponse:
-    url = _shared_db_url()
-    if not url:
-        raise HTTPException(status_code=500, detail="Shared database URL is not configured")
+async def sign_note(packet_id: str, request: Request) -> RedirectResponse:
+    require_session(request)
 
-    signed_by = _physician_signature_line()
+    row = query_one("SELECT chart_number FROM callcare.portal_packets WHERE packet_id = %s LIMIT 1;", (packet_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="Packet not found")
 
-    with psycopg.connect(url, row_factory=dict_row) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT chart_number FROM callcare.portal_packets WHERE packet_id = %s LIMIT 1",
-                (packet_id,),
-            )
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(status_code=404, detail="Packet not found")
-
-            chart_number = safe_str(row["chart_number"])
-
-            cur.execute(
-                """
-                UPDATE callcare.portal_packets
-                SET signed = true,
-                    signed_at = now(),
-                    signed_by = %s,
-                    status = 'completed',
-                    updated_at = now()
-                WHERE packet_id = %s
-                """,
-                (signed_by, packet_id),
-            )
-        conn.commit()
-
-    try:
-        groups = patient_groups()
-        patient_ctx = {}
-        for g in groups:
-            if safe_str(g.get("chart_number")) == chart_number:
-                patient_ctx = g.get("patient_ctx") or {}
-                break
-        _queue_or_send_new_note_email_resend(packet_id, patient_ctx, reason="note_ready")
-    except Exception:
-        pass
-
+    chart_number = safe_str(row.get("chart_number"))
+    execute(
+        "UPDATE callcare.portal_packets SET signed = true, signed_at = now(), signed_by = %s, status = 'completed', updated_at = now() WHERE packet_id = %s;",
+        (packet_id,),
+    )
+    patient_ctx = get_patient_context(chart_number) or {}
+    queue_or_send_new_note_email(packet_id, patient_ctx, reason="note_ready")
     return RedirectResponse(url=f"/patient/{chart_number}?packet_id={packet_id}&tab=encounters", status_code=303)
 
 
