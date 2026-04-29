@@ -1107,7 +1107,7 @@ async def sign_addendum_route(packet_id: str, request: Request, addendum_text: s
         {
             "text": safe_str(addendum_text),
             "signed_at": now_iso(),
-            "signed_by": "Physician",
+            "signed_by": "Kelly Kruk, DO | GA License #: 83704 | NPI: 1285682435",
         }
     )
     execute(
