@@ -16,6 +16,31 @@ app = FastAPI(title="CallCare Physician Portal")
 
 CALLCARE_SHARED_DATABASE_URL = os.getenv("CALLCARE_SHARED_DATABASE_URL", "").strip()
 CALLCARE_PUBLIC_BASE_URL = os.getenv("CALLCARE_PUBLIC_BASE_URL", "https://callcare.healthcare").rstrip("/")
+
+CALLCARE_TIMEZONE = os.getenv("CALLCARE_TIMEZONE", "America/New_York").strip() or "America/New_York"
+
+
+def _physician_signature_line() -> str:
+    name = os.getenv("CALLCARE_PHYSICIAN_NAME", "Kelly Kruk").strip() or "Kelly Kruk"
+    credentials = os.getenv("CALLCARE_PHYSICIAN_CREDENTIALS", "DO").strip()
+    license_no = os.getenv("CALLCARE_PHYSICIAN_LICENSE", "").strip()
+    npi = os.getenv("CALLCARE_PHYSICIAN_NPI", "").strip()
+
+    parts = [name]
+    if credentials:
+        parts[-1] = f"{parts[-1]}, {credentials}"
+    if license_no:
+        parts.append(license_no)
+    if npi:
+        parts.append(npi)
+    return " | ".join(parts)
+
+
+def _local_timestamp_for_db() -> str:
+    try:
+        return datetime.now(ZoneInfo(CALLCARE_TIMEZONE)).strftime("%Y-%m-%d %I:%M:%S %p %Z")
+    except Exception:
+        return datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
 CALLCARE_EMAIL_PROVIDER = os.getenv("CALLCARE_EMAIL_PROVIDER", "").strip().lower()
 CALLCARE_RESEND_API_KEY = os.getenv("CALLCARE_RESEND_API_KEY", "").strip()
 CALLCARE_PHYSICIAN_USERNAME = os.getenv("CALLCARE_PHYSICIAN_USERNAME", "").strip()
@@ -1081,7 +1106,7 @@ async def sign_note(packet_id: str, request: Request) -> RedirectResponse:
 
     chart_number = safe_str(row.get("chart_number"))
     execute(
-        "UPDATE callcare.portal_packets SET signed = true, signed_at = now(), signed_by = 'Physician', status = 'completed', updated_at = now() WHERE packet_id = %s;",
+        "UPDATE callcare.portal_packets SET signed = true, signed_at = now(), signed_by = %s, status = 'completed', updated_at = now() WHERE packet_id = %s;",
         (packet_id,),
     )
     patient_ctx = get_patient_context(chart_number) or {}
