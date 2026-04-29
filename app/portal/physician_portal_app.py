@@ -1081,7 +1081,7 @@ async def sign_note(packet_id: str, request: Request) -> RedirectResponse:
 
     chart_number = safe_str(row.get("chart_number"))
     execute(
-        "UPDATE callcare.portal_packets SET signed = true, signed_at = now(), signed_by = 'Physician', status = 'completed', updated_at = now() WHERE packet_id = %s;",
+        "UPDATE callcare.portal_packets SET signed = true, signed_at = now(), signed_by = 'Kelly Kruk, DO | GA License #: 83704 | NPI: 1285682435', status = 'completed', updated_at = now() WHERE packet_id = %s;",
         (packet_id,),
     )
     patient_ctx = get_patient_context(chart_number) or {}
