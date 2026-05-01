@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 PORTAL_INBOX_DIR = Path("logs") / "portal_inbox"
 PORTAL_INBOX_DIR.mkdir(parents=True, exist_ok=True)
@@ -31,6 +32,8 @@ SMTP_PASSWORD = os.getenv("CALLCARE_SMTP_PASSWORD", "").strip()
 SMTP_FROM = os.getenv("CALLCARE_SMTP_FROM", "").strip()
 SMTP_USE_TLS = os.getenv("CALLCARE_SMTP_USE_TLS", "true").strip().lower() == "true"
 
+PORTAL_TIMEZONE = ZoneInfo("America/New_York")
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -41,6 +44,29 @@ def safe_str(x: Any) -> str:
         return str(x if x is not None else "").strip()
     except Exception:
         return ""
+
+
+
+def portal_timestamp(value: Any) -> str:
+    text = safe_str(value)
+    if not text:
+        return ""
+
+    normalized = text.replace("T", " ").replace("Z", "+00:00")
+
+    try:
+        dt = datetime.fromisoformat(normalized)
+    except Exception:
+        try:
+            dt = datetime.strptime(normalized[:19], "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return text.split(".")[0]
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+
+    local_dt = dt.astimezone(PORTAL_TIMEZONE)
+    return local_dt.strftime("%Y-%m-%d %I:%M:%S %p %Z")
 
 
 def html_escape(s: Any) -> str:
@@ -424,8 +450,7 @@ def encounter_topic(chief_complaint: str) -> str:
 
 def encounter_when(started: str, created: str) -> str:
     value = safe_str(started) or safe_str(created)
-    value = value.replace("T", " ")
-    return value[:16] if value else ""
+    return portal_timestamp(value)
 
 
 def signature_line() -> str:
@@ -438,17 +463,20 @@ def signed_note_text(note_text: str, meta: Dict[str, Any]) -> str:
     if not meta.get("signed"):
         return text
 
-    signed_at = safe_str(meta.get("signed_at"))
+    signed_at = portal_timestamp(meta.get("signed_at"))
     signed_by = safe_str(meta.get("signed_by")) or signature_line()
     stamp = f"\n\nSigned electronically by {signed_by} on {signed_at}"
-    if stamp.strip() in text:
+
+    existing_prefix = f"Signed electronically by {signed_by} on "
+    if existing_prefix in text:
         return text
+
     return text + stamp
 
 
 def addendum_block(addendum: Dict[str, Any]) -> str:
     text = safe_str(addendum.get("text"))
-    signed_at = safe_str(addendum.get("signed_at"))
+    signed_at = portal_timestamp(addendum.get("signed_at"))
     signed_by = safe_str(addendum.get("signed_by")) or signature_line()
     return f"{text}\n\nSigned addendum by {signed_by} on {signed_at}"
 
