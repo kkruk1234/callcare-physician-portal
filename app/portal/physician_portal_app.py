@@ -991,7 +991,7 @@ async def patient_chart(
           <div class="metric"><div class="label">Date of Birth</div><div class="value">{html_escape(patient_ctx.get('date_of_birth'))}</div></div>
           <div class="metric"><div class="label">Sex at Birth</div><div class="value">{html_escape(patient_ctx.get('sex_at_birth'))}</div></div>
           <div class="metric"><div class="label">Chief Complaint</div><div class="value">{html_escape((selected_bundle.get('patient_ctx') or {}).get('chief_complaint'))}</div></div>
-          <div class="metric"><div class="label">Encounter Started</div><div class="value">{html_escape((selected_bundle.get('patient_ctx') or {}).get('encounter_started_at') or selected_bundle.get('created_at'))}</div></div>
+          <div class="metric"><div class="label">Encounter Started</div><div class="value">{html_escape(format_portal_time((selected_bundle.get('patient_ctx') or {}).get('encounter_started_at') or selected_bundle.get('created_at')))}</div></div>
           <div class="metric"><div class="label">Status</div><div class="value">{html_escape(selected_meta.get('status'))}</div></div>
         </div>
 
