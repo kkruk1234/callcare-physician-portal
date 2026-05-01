@@ -5,6 +5,7 @@ import os
 import secrets
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import psycopg
 import requests
@@ -89,28 +90,52 @@ def require_session(request: Request) -> Dict[str, str]:
     return sess
 
 
+PORTAL_TIMEZONE = ZoneInfo("America/New_York")
+
+
+def format_portal_time(value: Any) -> str:
+    text = safe_str(value)
+    if not text:
+        return ""
+
+    normalized = text.replace("T", " ").replace("Z", "+00:00")
+
+    try:
+        dt = datetime.fromisoformat(normalized)
+    except Exception:
+        try:
+            dt = datetime.strptime(normalized[:19], "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return text.split(".")[0]
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+
+    return dt.astimezone(PORTAL_TIMEZONE).strftime("%Y-%m-%d %I:%M:%S %p %Z")
+
+
 def signed_note_text(note_text: str, meta: Dict[str, Any]) -> str:
     text = safe_str(note_text)
     if not meta.get("signed"):
         return text
-    signed_at = safe_str(meta.get("signed_at"))
+    signed_at = format_portal_time(meta.get("signed_at"))
     signed_by = safe_str(meta.get("signed_by"))
     stamp = f"\n\nSigned electronically by {signed_by} on {signed_at}"
-    if stamp.strip() in text:
+    existing_prefix = f"Signed electronically by {signed_by} on "
+    if existing_prefix in text:
         return text
     return text + stamp
 
 
 def addendum_block(addendum: Dict[str, Any]) -> str:
     text = safe_str(addendum.get("text"))
-    signed_at = safe_str(addendum.get("signed_at"))
+    signed_at = format_portal_time(addendum.get("signed_at"))
     signed_by = safe_str(addendum.get("signed_by"))
     return f"{text}\n\nSigned addendum by {signed_by} on {signed_at}"
 
 
 def encounter_when(dt_text: str) -> str:
-    dt_text = safe_str(dt_text)
-    return dt_text.replace("T", " ").replace("+00:00", " UTC") if dt_text else ""
+    return format_portal_time(dt_text)
 
 
 def render_list_items(items: List[Dict[str, Any]], keys: List[str], empty_text: str) -> str:
