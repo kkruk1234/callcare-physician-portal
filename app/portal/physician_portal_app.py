@@ -815,6 +815,176 @@ async def home(request: Request) -> str:
     )
 
 
+
+def allergy_severity_options(selected: str) -> str:
+    selected = safe_str(selected).lower()
+    options = ["", "mild", "moderate", "severe", "life-threatening"]
+    labels = {
+        "": "Select",
+        "mild": "Mild",
+        "moderate": "Moderate",
+        "severe": "Severe",
+        "life-threatening": "Life-threatening",
+    }
+    return "".join(
+        f"<option value='{html_escape(v)}' {'selected' if selected == v else ''}>{html_escape(labels[v])}</option>"
+        for v in options
+    )
+
+
+def physician_history_allergies_form(chart_number: str, packet_id: str) -> str:
+    bundle = patient_history_allergies_bundle(chart_number)
+    conditions = bundle.get("conditions") or []
+    allergies = bundle.get("allergies") or []
+
+    existing = {}
+    for item in conditions:
+        existing[safe_str(item.get("condition_name")).lower()] = item
+
+    common_names = {safe_str(c).lower() for c in COMMON_HISTORY_CONDITIONS}
+    seen_other = set()
+    other_lines = []
+    for item in conditions:
+        name = safe_str(item.get("condition_name"))
+        key = name.lower()
+        if not name or key in common_names or key in seen_other:
+            continue
+        seen_other.add(key)
+        other_lines.append(name)
+
+    other_existing = "\n".join(other_lines)
+
+    rows = []
+    for cond in COMMON_HISTORY_CONDITIONS:
+        key = cond.lower()
+        item = existing.get(key) or {}
+        form_key = cond.lower().replace(" ", "_")
+
+        rows.append(
+            f"""
+            <tr style="background:{'rgba(47,158,143,0.10)' if len(rows) % 2 == 0 else 'rgba(255,255,255,0.96)'};">
+              <td>{html_escape(cond)}</td>
+              <td style="text-align:center;"><input type="checkbox" name="{html_escape(form_key)}_current" {"checked" if item.get("current_flag") else ""}></td>
+              <td style="text-align:center;"><input type="checkbox" name="{html_escape(form_key)}_past" {"checked" if item.get("past_flag") else ""}></td>
+              <td style="text-align:center;"><input type="checkbox" name="{html_escape(form_key)}_family" {"checked" if item.get("family_history_flag") else ""}></td>
+            </tr>
+            """
+        )
+
+    allergy_rows = []
+    total_allergy_rows = max(5, len(allergies))
+
+    for i in range(total_allergy_rows):
+        item = allergies[i] if i < len(allergies) else {}
+        allergen = safe_str(item.get("allergen"))
+        reaction = safe_str(item.get("reaction"))
+        severity = safe_str(item.get("severity"))
+        active_checked = "checked" if allergen and item.get("is_active") is True else ""
+
+        allergy_rows.append(
+            f"""
+            <tr style="background:{'rgba(47,158,143,0.10)' if i % 2 == 0 else 'rgba(255,255,255,0.96)'};">
+              <td><input name="allergy_{i}_allergen" value="{html_escape(allergen)}" placeholder="Allergen" oninput="autoCheckAllergyRow(this)" /></td>
+              <td><input name="allergy_{i}_reaction" value="{html_escape(reaction)}" placeholder="Reaction" /></td>
+              <td><select name="allergy_{i}_severity">{allergy_severity_options(severity)}</select></td>
+              <td style="text-align:center;"><input type="checkbox" name="allergy_{i}_active" {active_checked} /></td>
+            </tr>
+            """
+        )
+
+    return f"""
+    <form method="post" action="/patient/{html_escape(chart_number)}/history-allergies?packet_id={html_escape(packet_id)}">
+      <div class="card">
+        <h2 class="section-title">Medical History</h2>
+
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:18px;align-items:start;">
+          <table>
+            <thead><tr><th>Condition</th><th>Current</th><th>Past</th><th>Family History</th></tr></thead>
+            <tbody>{''.join(rows[:(len(rows)+1)//2])}</tbody>
+          </table>
+
+          <table>
+            <thead><tr><th>Condition</th><th>Current</th><th>Past</th><th>Family History</th></tr></thead>
+            <tbody>{''.join(rows[(len(rows)+1)//2:])}</tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2 class="section-title">Other Conditions</h2>
+        <textarea name="other_conditions" rows="6" style="width:100%;border-radius:12px;padding:12px;">{html_escape(other_existing)}</textarea>
+      </div>
+
+      <div class="card">
+        <h2 class="section-title">Allergies</h2>
+
+        <table id="allergies-table">
+          <thead><tr><th>Allergen</th><th>Reaction</th><th>Severity</th><th>Active</th></tr></thead>
+          <tbody id="allergies-body">{''.join(allergy_rows)}</tbody>
+        </table>
+
+        <div style="margin-top:18px;display:flex;justify-content:flex-end;">
+          <button type="button" onclick="addAllergyRow()" style="font-size:15px;padding:10px 16px;border-radius:18px;font-weight:800;">Add Additional Row</button>
+        </div>
+
+        <div style="margin-top:22px;">
+          <button type="submit" style="font-size:16px;padding:12px 18px;border-radius:18px;font-weight:800;">Save Medical History & Allergies</button>
+        </div>
+      </div>
+
+      <script>
+        let nextAllergyIndex = {total_allergy_rows};
+
+        function autoCheckAllergyRow(input) {{
+          const row = input.closest("tr");
+          if (!row) return;
+          const checkbox = row.querySelector("input[type='checkbox']");
+          if (!checkbox) return;
+          if (input.value.trim().length > 0) checkbox.checked = true;
+          if (input.value.trim().length === 0) checkbox.checked = false;
+        }}
+
+        function addAllergyRow() {{
+          const body = document.getElementById("allergies-body");
+          const i = nextAllergyIndex++;
+          const tr = document.createElement("tr");
+          tr.style.background = i % 2 === 0 ? "rgba(47,158,143,0.10)" : "rgba(255,255,255,0.96)";
+          tr.innerHTML = `
+            <td><input name="allergy_${{i}}_allergen" placeholder="Allergen" oninput="autoCheckAllergyRow(this)" /></td>
+            <td><input name="allergy_${{i}}_reaction" placeholder="Reaction" /></td>
+            <td>
+              <select name="allergy_${{i}}_severity">
+                <option value="">Select</option>
+                <option value="mild">Mild</option>
+                <option value="moderate">Moderate</option>
+                <option value="severe">Severe</option>
+                <option value="life-threatening">Life-threatening</option>
+              </select>
+            </td>
+            <td style="text-align:center;"><input type="checkbox" name="allergy_${{i}}_active" /></td>
+          `;
+          body.appendChild(tr);
+        }}
+      </script>
+    </form>
+    """
+
+
+@app.post("/patient/{chart_number}/history-allergies")
+async def save_physician_history_allergies(
+    chart_number: str,
+    request: Request,
+    packet_id: str = Query(default=""),
+) -> RedirectResponse:
+    require_session(request)
+    form = await request.form()
+    save_patient_history_allergies(chart_number, dict(form), actor_type="physician")
+    return RedirectResponse(
+        url=f"/patient/{chart_number}?packet_id={packet_id}&tab=pmh",
+        status_code=303,
+    )
+
+
 @app.get("/patient/{chart_number}", response_class=HTMLResponse)
 async def patient_chart(
     chart_number: str,
