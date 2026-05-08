@@ -1100,13 +1100,13 @@ def physician_patient_style_history_html(chart_number: str) -> str:
             <tr style="background:{'rgba(47,158,143,0.10)' if len(rows) % 2 == 0 else 'rgba(255,255,255,0.95)'};">
               <td style="font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;">{html_escape(cond)}</td>
               <td style="text-align:center;font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;">
-                <input type="checkbox" disabled class="pmh-checkbox" name="{html_escape(form_key)}_current" {"checked" if item.get("current_flag") else ""}>
+                <input type="checkbox" name="{html_escape(form_key)}_current" {"checked" if item.get("current_flag") else ""}>
               </td>
               <td style="text-align:center;font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;">
-                <input type="checkbox" disabled class="pmh-checkbox" name="{html_escape(form_key)}_past" {"checked" if item.get("past_flag") else ""}>
+                <input type="checkbox" name="{html_escape(form_key)}_past" {"checked" if item.get("past_flag") else ""}>
               </td>
               <td style="text-align:center;font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;">
-                <input type="checkbox" disabled class="pmh-checkbox" name="{html_escape(form_key)}_family" {"checked" if item.get("family_history_flag") else ""}>
+                <input type="checkbox" name="{html_escape(form_key)}_family" {"checked" if item.get("family_history_flag") else ""}>
               </td>
             </tr>
             """
@@ -1122,6 +1122,7 @@ def physician_patient_style_history_html(chart_number: str) -> str:
         """
 
     return f"""
+      <form method="post" action="/patient/{html_escape(chart_number)}/history?packet_id={html_escape(selected_packet_id)}">
       <div class="card">
         <h2 class="section-title">Medical History</h2>
         <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:18px;align-items:start;">
@@ -1151,6 +1152,10 @@ def physician_patient_style_history_html(chart_number: str) -> str:
         </div>
       </div>
       {other_html}
+      <div class="card" style="margin-top:20px;">
+        <button type="submit">Save Medical History</button>
+      </div>
+      </form>
     """
 
 
