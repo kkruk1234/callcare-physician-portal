@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 import psycopg
 import requests
+import app.portal.portal_common as portal_common
 from psycopg.rows import dict_row
 from fastapi import FastAPI, Form, HTTPException, Query, Request, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
