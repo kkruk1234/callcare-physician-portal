@@ -605,3 +605,241 @@ def queue_or_send_new_note_email(patient_ctx: Dict[str, Any], chart_number: str,
 
 def make_session_token() -> str:
     return secrets.token_urlsafe(32)
+
+
+
+COMMON_HISTORY_CONDITIONS = ['Hypertension', 'Diabetes', 'High Cholesterol', 'Coronary Artery Disease', 'Heart Failure', 'Atrial Fibrillation', 'Stroke', 'COPD', 'Asthma', 'Sleep Apnea', 'GERD', 'Peptic Ulcer Disease', 'Irritable Bowel Syndrome', 'Crohn Disease', 'Ulcerative Colitis', 'Chronic Kidney Disease', 'Kidney Stones', 'Migraines', 'Seizure Disorder', 'Depression', 'Anxiety', 'Bipolar Disorder', 'PTSD', 'ADHD', 'Hypothyroidism', 'Hyperthyroidism', 'Obesity', 'Osteoarthritis', 'Rheumatoid Arthritis', 'Fibromyalgia', 'Osteoporosis', 'Chronic Back Pain', 'Anemia', 'Cancer', 'Breast Cancer', 'Colon Cancer', 'Prostate Cancer', 'Skin Cancer', 'Liver Disease', 'Hepatitis', 'HIV', 'Peripheral Neuropathy', 'Dementia', 'Parkinson Disease', 'Glaucoma', 'Macular Degeneration', 'Seasonal Allergies', 'Eczema', 'Psoriasis', 'Gout']
+
+
+def patient_history_allergies_bundle(chart_number: str) -> Dict[str, Any]:
+    sql = r"""
+    SELECT json_build_object(
+      'patient_id', p.id::text,
+      'conditions',
+        COALESCE((
+          SELECT json_agg(
+            json_build_object(
+              'condition_name', condition_name,
+              'current_flag', current_flag,
+              'past_flag', past_flag,
+              'family_history_flag', family_history_flag,
+              'notes', notes
+            )
+            ORDER BY condition_name
+          )
+          FROM callcare.patient_conditions c
+          WHERE c.patient_id = p.id
+            AND c.archived_at IS NULL
+        ), '[]'::json),
+      'allergies',
+        COALESCE((
+          SELECT json_agg(
+            json_build_object(
+              'allergen', allergen,
+              'reaction', reaction,
+              'severity', severity,
+              'is_active', is_active
+            )
+            ORDER BY is_active DESC, updated_at DESC, created_at DESC
+          )
+          FROM callcare.patient_allergies a
+          WHERE a.patient_id = p.id
+        ), '[]'::json)
+    )
+    FROM callcare.patients p
+    WHERE p.chart_number = NULLIF(:'CHART_NUMBER', '')
+      AND p.archived_at IS NULL
+    LIMIT 1;
+    """
+    out = run_psql(sql, {"CHART_NUMBER": safe_str(chart_number)})
+    return json.loads(out) if out else {"patient_id": "", "conditions": [], "allergies": []}
+
+
+def save_patient_history_allergies(
+    chart_number: str,
+    form: Dict[str, Any],
+    actor_type: str = "physician",
+) -> None:
+    bundle = patient_history_allergies_bundle(chart_number)
+    patient_id = safe_str(bundle.get("patient_id"))
+
+    if not patient_id:
+        return
+
+    condition_rows = []
+
+    for cond in COMMON_HISTORY_CONDITIONS:
+        key = cond.lower().replace(" ", "_")
+        current_flag = safe_str(form.get(f"{key}_current")).lower() == "on"
+        past_flag = safe_str(form.get(f"{key}_past")).lower() == "on"
+        family_flag = safe_str(form.get(f"{key}_family")).lower() == "on"
+
+        if current_flag or past_flag or family_flag:
+            condition_rows.append({
+                "condition_name": cond,
+                "current_flag": current_flag,
+                "past_flag": past_flag,
+                "family_history_flag": family_flag,
+                "notes": "",
+            })
+
+    other_text = safe_str(form.get("other_conditions"))
+    if other_text:
+        for line in other_text.splitlines():
+            line = safe_str(line)
+            if line:
+                condition_rows.append({
+                    "condition_name": line,
+                    "current_flag": True,
+                    "past_flag": False,
+                    "family_history_flag": False,
+                    "notes": "other_condition_writein",
+                })
+
+    run_psql(
+        """
+        UPDATE callcare.patient_conditions
+        SET archived_at = now()
+        WHERE patient_id = NULLIF(:'PATIENT_ID', '')::uuid
+          AND archived_at IS NULL;
+        """,
+        {"PATIENT_ID": patient_id},
+    )
+
+    for row in condition_rows:
+        run_psql(
+            """
+            INSERT INTO callcare.patient_conditions (
+              id,
+              patient_id,
+              condition_name,
+              current_flag,
+              past_flag,
+              family_history_flag,
+              notes,
+              source,
+              verification_status,
+              created_at,
+              updated_at
+            )
+            VALUES (
+              gen_random_uuid(),
+              NULLIF(:'PATIENT_ID', '')::uuid,
+              :'CONDITION_NAME',
+              CASE WHEN :'CURRENT_FLAG' = 'true' THEN true ELSE false END,
+              CASE WHEN :'PAST_FLAG' = 'true' THEN true ELSE false END,
+              CASE WHEN :'FAMILY_FLAG' = 'true' THEN true ELSE false END,
+              NULLIF(:'NOTES', ''),
+              'physician_portal',
+              'physician_verified',
+              now(),
+              now()
+            );
+            """,
+            {
+                "PATIENT_ID": patient_id,
+                "CONDITION_NAME": row["condition_name"],
+                "CURRENT_FLAG": str(row["current_flag"]).lower(),
+                "PAST_FLAG": str(row["past_flag"]).lower(),
+                "FAMILY_FLAG": str(row["family_history_flag"]).lower(),
+                "NOTES": row["notes"],
+            },
+        )
+
+    allergy_rows = []
+    for i in range(20):
+        allergen = safe_str(form.get(f"allergy_{i}_allergen")).strip()
+        if not allergen:
+            continue
+
+        reaction = safe_str(form.get(f"allergy_{i}_reaction")).strip()
+        severity = safe_str(form.get(f"allergy_{i}_severity")).strip()
+        active = safe_str(form.get(f"allergy_{i}_active")).lower() == "on"
+
+        allergy_rows.append({
+            "allergen": allergen,
+            "reaction": reaction,
+            "severity": severity,
+            "active": active,
+        })
+
+    run_psql(
+        """
+        DELETE FROM callcare.patient_allergies
+        WHERE patient_id = NULLIF(:'PATIENT_ID', '')::uuid;
+        """,
+        {"PATIENT_ID": patient_id},
+    )
+
+    for row in allergy_rows:
+        run_psql(
+            """
+            INSERT INTO callcare.patient_allergies (
+              id,
+              patient_id,
+              allergen,
+              reaction,
+              severity,
+              is_active,
+              source,
+              verification_status,
+              created_at,
+              updated_at
+            )
+            VALUES (
+              gen_random_uuid(),
+              NULLIF(:'PATIENT_ID', '')::uuid,
+              :'ALLERGEN',
+              NULLIF(:'REACTION', ''),
+              NULLIF(:'SEVERITY', ''),
+              CASE WHEN :'ACTIVE' = 'true' THEN true ELSE false END,
+              'physician_portal',
+              'physician_verified',
+              now(),
+              now()
+            );
+            """,
+            {
+                "PATIENT_ID": patient_id,
+                "ALLERGEN": row["allergen"],
+                "REACTION": row["reaction"],
+                "SEVERITY": row["severity"],
+                "ACTIVE": str(row["active"]).lower(),
+            },
+        )
+
+    run_psql(
+        """
+        INSERT INTO callcare.audit_events (
+          id,
+          actor_type,
+          actor_id,
+          patient_id,
+          encounter_id,
+          event_type,
+          event_json,
+          created_at
+        )
+        VALUES (
+          gen_random_uuid(),
+          :'ACTOR_TYPE',
+          NULL,
+          NULLIF(:'PATIENT_ID', '')::uuid,
+          NULL,
+          'patient_history_allergies_updated_by_physician',
+          jsonb_build_object(
+            'source', 'physician_portal',
+            'changed_by', :'ACTOR_TYPE',
+            'condition_count', :'CONDITION_COUNT',
+            'allergy_count', :'ALLERGY_COUNT'
+          ),
+          now()
+        );
+        """,
+        {
+            "ACTOR_TYPE": safe_str(actor_type) or "physician",
+            "PATIENT_ID": patient_id,
+            "CONDITION_COUNT": str(len(condition_rows)),
+            "ALLERGY_COUNT": str(len(allergy_rows)),
+        },
+    )
