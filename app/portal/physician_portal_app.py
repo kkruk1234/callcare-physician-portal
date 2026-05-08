@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 import psycopg
 import requests
 from psycopg.rows import dict_row
-from fastapi import FastAPI, Form, HTTPException, Query, Request
+from fastapi import FastAPI, Form, HTTPException, Query, Request, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 
 app = FastAPI(title="CallCare Physician Portal")
@@ -1202,7 +1202,7 @@ async def patient_chart(
         <p><a href="/">← Back to patient list</a> | <a href="/logout">Log out</a></p>
 
         <div class="tabs">
-          {tab_link("demographics", "Demographics + Pharmacy")}
+          {tab_link("demographics", "Demographics & Pharmacy")}
           {tab_link("pmh", "Medical History & Allergies")}
           {tab_link("social", "Social History")}
           {tab_link("encounters", "Encounters")}
