@@ -679,18 +679,9 @@ def shell(title: str, body: str) -> str:
             box-shadow: 0 8px 18px rgba(29,143,138,0.18);
           }}
           .detail-list {{ margin: 0; padding-left: 18px; }}
-          .pmh-checkbox {{
-            width: 20px;
-            height: 20px;
-            opacity: 1;
-            accent-color: #000000;
-            filter: none;
-          }}
-          .pmh-checkbox:disabled {{
-            opacity: 1;
-            appearance: auto;
-            -webkit-appearance: checkbox;
-          }}
+          .pmh-checkbox:checked {
+            accent-color: #000000 !important;
+          }
           .login-card {{ max-width: 520px; margin: 80px auto 0 auto; }}
           input {{
             width: 100%;
