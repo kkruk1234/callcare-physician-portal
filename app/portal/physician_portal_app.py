@@ -1070,7 +1070,7 @@ def physician_history_rows_from_db(chart_number: str):
             return [dict(r) for r in cur.fetchall()]
 
 
-def physician_patient_style_history_html(chart_number: str) -> str:
+def physician_patient_style_history_html(chart_number: str, selected_packet_id: str) -> str:
     conditions = physician_history_rows_from_db(chart_number)
 
     existing = {}
@@ -1237,7 +1237,7 @@ async def patient_chart(
       </div>
     """
 
-    pmh_panel = physician_patient_style_history_html(chart_number)
+    pmh_panel = physician_patient_style_history_html(chart_number, selected_packet_id)
     social_panel = f"""
       <div class="card">
         <h2 class="section-title">Past Social History</h2>
