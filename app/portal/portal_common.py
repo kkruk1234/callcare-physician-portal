@@ -222,12 +222,16 @@ def lookup_patient_context(call_sid: str) -> Dict[str, Any]:
             SELECT json_agg(
               json_build_object(
                 'condition_name', pc.condition_name,
-                'status', pc.status
+                'current_flag', pc.current_flag,
+                'past_flag', pc.past_flag,
+                'family_history_flag', pc.family_history_flag,
+                'notes', pc.notes
               )
-              ORDER BY pc.created_at
+              ORDER BY pc.condition_name
             )
             FROM callcare.patient_conditions pc
             WHERE pc.patient_id = p.id
+              AND pc.archived_at IS NULL
           ),
           '[]'::json
         ),

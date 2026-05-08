@@ -155,6 +155,59 @@ def render_list_items(items: List[Dict[str, Any]], keys: List[str], empty_text: 
     return "<ul class='detail-list'>" + "".join(rendered) + "</ul>"
 
 
+
+def render_structured_pmh(items) -> str:
+    if not items:
+        return "<p>No past medical history on file.</p>"
+
+    seen = set()
+    rows = []
+
+    for item in items:
+        name = safe_str(item.get("condition_name"))
+        if not name:
+            continue
+
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+
+        current = "✓" if item.get("current_flag") else ""
+        past = "✓" if item.get("past_flag") else ""
+        family = "✓" if item.get("family_history_flag") else ""
+
+        rows.append(
+            f"""
+            <tr>
+              <td>{html_escape(name)}</td>
+              <td style="text-align:center;">{current}</td>
+              <td style="text-align:center;">{past}</td>
+              <td style="text-align:center;">{family}</td>
+            </tr>
+            """
+        )
+
+    if not rows:
+        return "<p>No past medical history on file.</p>"
+
+    return f"""
+    <table>
+      <thead>
+        <tr>
+          <th>Condition</th>
+          <th>Current</th>
+          <th>Past</th>
+          <th>Family History</th>
+        </tr>
+      </thead>
+      <tbody>
+        {''.join(rows)}
+      </tbody>
+    </table>
+    """
+
+
 def render_pharmacy(ph: Optional[Dict[str, Any]]) -> str:
     if not ph:
         return "<p>No preferred pharmacy on file.</p>"
@@ -1037,11 +1090,7 @@ async def patient_chart(
         ["allergen", "reaction", "severity"],
         "No allergy data on file.",
     )
-    conditions_html = render_list_items(
-        patient_ctx.get("conditions") or [],
-        ["condition_name", "status"],
-        "No past medical history on file.",
-    )
+    conditions_html = render_structured_pmh(patient_ctx.get("conditions") or [])
     social_html = render_list_items(
         patient_ctx.get("social_history") or [],
         ["domain", "value_text"],
