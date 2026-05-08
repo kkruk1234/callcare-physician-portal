@@ -679,6 +679,18 @@ def shell(title: str, body: str) -> str:
             box-shadow: 0 8px 18px rgba(29,143,138,0.18);
           }}
           .detail-list {{ margin: 0; padding-left: 18px; }}
+          .pmh-checkbox {{
+            width: 20px;
+            height: 20px;
+            opacity: 1;
+            accent-color: #000000;
+            filter: none;
+          }}
+          .pmh-checkbox:disabled {{
+            opacity: 1;
+            appearance: auto;
+            -webkit-appearance: checkbox;
+          }}
           .login-card {{ max-width: 520px; margin: 80px auto 0 auto; }}
           input {{
             width: 100%;
@@ -1100,13 +1112,13 @@ def physician_patient_style_history_html(chart_number: str) -> str:
             <tr style="background:{'rgba(47,158,143,0.10)' if len(rows) % 2 == 0 else 'rgba(255,255,255,0.95)'};">
               <td style="font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;">{html_escape(cond)}</td>
               <td style="text-align:center;font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;">
-                <input type="checkbox" disabled style="accent-color:#111;filter:contrast(2.4);" name="{html_escape(form_key)}_current" {"checked" if item.get("current_flag") else ""}>
+                <input type="checkbox" disabled class="pmh-checkbox" name="{html_escape(form_key)}_current" {"checked" if item.get("current_flag") else ""}>
               </td>
               <td style="text-align:center;font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;">
-                <input type="checkbox" disabled style="accent-color:#111;filter:contrast(2.4);" name="{html_escape(form_key)}_past" {"checked" if item.get("past_flag") else ""}>
+                <input type="checkbox" disabled class="pmh-checkbox" name="{html_escape(form_key)}_past" {"checked" if item.get("past_flag") else ""}>
               </td>
               <td style="text-align:center;font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;">
-                <input type="checkbox" disabled style="accent-color:#111;filter:contrast(2.4);" name="{html_escape(form_key)}_family" {"checked" if item.get("family_history_flag") else ""}>
+                <input type="checkbox" disabled class="pmh-checkbox" name="{html_escape(form_key)}_family" {"checked" if item.get("family_history_flag") else ""}>
               </td>
             </tr>
             """
