@@ -833,7 +833,7 @@ def allergy_severity_options(selected: str) -> str:
 
 
 def physician_history_allergies_form(chart_number: str, packet_id: str) -> str:
-    bundle = patient_history_allergies_bundle(chart_number)
+    bundle = portal_common.patient_history_allergies_bundle(chart_number)
     conditions = bundle.get("conditions") or []
     allergies = bundle.get("allergies") or []
 
@@ -978,7 +978,7 @@ async def save_physician_history_allergies(
 ) -> RedirectResponse:
     require_session(request)
     form = await request.form()
-    save_patient_history_allergies(chart_number, dict(form), actor_type="physician")
+    portal_common.save_patient_history_allergies(chart_number, dict(form), actor_type="physician")
     return RedirectResponse(
         url=f"/patient/{chart_number}?packet_id={packet_id}&tab=pmh",
         status_code=303,
