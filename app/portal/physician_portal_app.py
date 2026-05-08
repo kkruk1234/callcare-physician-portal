@@ -1038,6 +1038,122 @@ async def save_physician_history_allergies(
     )
 
 
+
+COMMON_HISTORY_CONDITIONS_PHYSICIAN = ['Hypertension', 'Diabetes', 'High Cholesterol', 'Coronary Artery Disease', 'Heart Failure', 'Atrial Fibrillation', 'Stroke', 'COPD', 'Asthma', 'Sleep Apnea', 'GERD', 'Peptic Ulcer Disease', 'Irritable Bowel Syndrome', 'Crohn Disease', 'Ulcerative Colitis', 'Chronic Kidney Disease', 'Kidney Stones', 'Migraines', 'Seizure Disorder', 'Depression', 'Anxiety', 'Bipolar Disorder', 'PTSD', 'ADHD', 'Hypothyroidism', 'Hyperthyroidism', 'Obesity', 'Osteoarthritis', 'Rheumatoid Arthritis', 'Fibromyalgia', 'Osteoporosis', 'Chronic Back Pain', 'Anemia', 'Cancer', 'Breast Cancer', 'Colon Cancer', 'Prostate Cancer', 'Skin Cancer', 'Liver Disease', 'Hepatitis', 'HIV', 'Peripheral Neuropathy', 'Dementia', 'Parkinson Disease', 'Glaucoma', 'Macular Degeneration', 'Seasonal Allergies', 'Eczema', 'Psoriasis', 'Gout']
+
+
+def physician_history_rows_from_db(chart_number: str):
+    if not CALLCARE_SHARED_DATABASE_URL:
+        return []
+
+    with psycopg.connect(CALLCARE_SHARED_DATABASE_URL, row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                  c.condition_name,
+                  bool_or(c.current_flag) AS current_flag,
+                  bool_or(c.past_flag) AS past_flag,
+                  bool_or(c.family_history_flag) AS family_history_flag,
+                  string_agg(DISTINCT COALESCE(c.notes, ''), '; ') AS notes
+                FROM callcare.patients p
+                JOIN callcare.patient_conditions c
+                  ON c.patient_id = p.id
+                WHERE p.chart_number = %s
+                  AND p.archived_at IS NULL
+                  AND c.archived_at IS NULL
+                GROUP BY c.condition_name
+                ORDER BY c.condition_name
+                """,
+                (chart_number,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+
+def physician_patient_style_history_html(chart_number: str) -> str:
+    conditions = physician_history_rows_from_db(chart_number)
+
+    existing = {}
+    for item in conditions:
+        existing[safe_str(item.get("condition_name")).lower()] = item
+
+    common_names = {safe_str(c).lower() for c in COMMON_HISTORY_CONDITIONS_PHYSICIAN}
+    seen_other = set()
+    other_lines = []
+
+    for item in conditions:
+        name = safe_str(item.get("condition_name"))
+        key = name.lower()
+        if not name or key in common_names or key in seen_other:
+            continue
+        seen_other.add(key)
+        other_lines.append(name)
+
+    rows = []
+
+    for cond in COMMON_HISTORY_CONDITIONS_PHYSICIAN:
+        item = existing.get(cond.lower()) or {}
+        form_key = cond.lower().replace(" ", "_")
+
+        rows.append(
+            f"""
+            <tr style="background:{'rgba(47,158,143,0.10)' if len(rows) % 2 == 0 else 'rgba(255,255,255,0.95)'};">
+              <td style="font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;">{html_escape(cond)}</td>
+              <td style="text-align:center;font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;">
+                <input type="checkbox" disabled name="{html_escape(form_key)}_current" {"checked" if item.get("current_flag") else ""}>
+              </td>
+              <td style="text-align:center;font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;">
+                <input type="checkbox" disabled name="{html_escape(form_key)}_past" {"checked" if item.get("past_flag") else ""}>
+              </td>
+              <td style="text-align:center;font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;">
+                <input type="checkbox" disabled name="{html_escape(form_key)}_family" {"checked" if item.get("family_history_flag") else ""}>
+              </td>
+            </tr>
+            """
+        )
+
+    other_html = ""
+    if other_lines:
+        other_html = f"""
+        <div class="card" style="margin-top:20px;">
+          <h2 class="section-title">Other Conditions</h2>
+          <div class="readonly">{html_escape(chr(10).join(other_lines))}</div>
+        </div>
+        """
+
+    return f"""
+      <div class="card">
+        <h2 class="section-title">Medical History</h2>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:18px;align-items:start;">
+          <table style="font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;">
+            <thead>
+              <tr>
+                <th>Condition</th>
+                <th>Current</th>
+                <th>Past</th>
+                <th>Family History</th>
+              </tr>
+            </thead>
+            <tbody>{''.join(rows[:(len(rows)+1)//2])}</tbody>
+          </table>
+
+          <table style="font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;">
+            <thead>
+              <tr>
+                <th>Condition</th>
+                <th>Current</th>
+                <th>Past</th>
+                <th>Family History</th>
+              </tr>
+            </thead>
+            <tbody>{''.join(rows[(len(rows)+1)//2:])}</tbody>
+          </table>
+        </div>
+      </div>
+      {other_html}
+    """
+
+
 @app.get("/patient/{chart_number}", response_class=HTMLResponse)
 async def patient_chart(
     chart_number: str,
@@ -1116,16 +1232,7 @@ async def patient_chart(
       </div>
     """
 
-    pmh_panel = f"""
-      <div class="card">
-        <h2 class="section-title">Past Medical History</h2>
-        {conditions_html}
-      </div>
-      <div class="card">
-        <h2 class="section-title">Allergies</h2>
-        {allergies_html}
-      </div>
-    """
+    pmh_panel = physician_patient_style_history_html(chart_number)
     social_panel = f"""
       <div class="card">
         <h2 class="section-title">Past Social History</h2>
@@ -1260,7 +1367,7 @@ async def patient_chart(
 
         <div class="tabs">
           {tab_link("demographics", "Demographics & Pharmacy")}
-          {tab_link("pmh", "Past Medical History")}
+          {tab_link("pmh", "Medical History")}
           {tab_link("social", "Social History")}
           {tab_link("encounters", "Encounters")}
         </div>
