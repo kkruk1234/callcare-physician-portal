@@ -1067,16 +1067,7 @@ async def patient_chart(
       </div>
     """
 
-    pmh_panel = f"""
-      <div class="card">
-        <h2 class="section-title">Past Medical History</h2>
-        {conditions_html}
-      </div>
-      <div class="card">
-        <h2 class="section-title">Allergies</h2>
-        {allergies_html}
-      </div>
-    """
+    pmh_panel = physician_history_allergies_form(chart_number, selected_packet_id)
 
     social_panel = f"""
       <div class="card">
@@ -1212,7 +1203,7 @@ async def patient_chart(
 
         <div class="tabs">
           {tab_link("demographics", "Demographics & Pharmacy")}
-          {tab_link("pmh", "Past Medical History")}
+          {tab_link("pmh", "Medical History & Allergies")}
           {tab_link("social", "Social History")}
           {tab_link("encounters", "Encounters")}
         </div>
