@@ -1873,7 +1873,7 @@ async def save_physician_demographics(
                   %s::uuid,
                   NULLIF(%s, '')::integer,
                   NULLIF(%s, '')::integer,
-                  NULLIF(%s, '')::numeric,
+                  %s,
                   'physician_portal',
                   now(),
                   now()
@@ -2053,6 +2053,17 @@ def physician_social_bundle(chart_number: str) -> dict:
                 (patient_id,),
             )
             return dict(cur.fetchone() or {})
+
+
+
+def numeric_or_none(value):
+    text = safe_str(value).strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except Exception:
+        return None
 
 
 def physician_social_form_html(chart_number: str, selected_packet_id: str) -> str:
@@ -2375,7 +2386,7 @@ async def save_physician_social(
                     safe_str(form.get("protection_type")),
                     previous_tobacco_user,
                     safe_str(form.get("tobacco_products")),
-                    safe_str(form.get("cigarette_packs_per_day")),
+                    numeric_or_none(form.get("cigarette_packs_per_day")),
                     safe_str(form.get("recreational_drug_use")),
                 ),
             )
