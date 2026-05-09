@@ -1070,8 +1070,34 @@ def physician_history_rows_from_db(chart_number: str):
             return [dict(r) for r in cur.fetchall()]
 
 
+def physician_allergy_rows_from_db(chart_number: str):
+    if not CALLCARE_SHARED_DATABASE_URL:
+        return []
+
+    with psycopg.connect(CALLCARE_SHARED_DATABASE_URL, row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                  a.allergen,
+                  a.reaction,
+                  a.severity,
+                  a.is_active
+                FROM callcare.patients p
+                JOIN callcare.patient_allergies a
+                  ON a.patient_id = p.id
+                WHERE p.chart_number = %s
+                  AND p.archived_at IS NULL
+                ORDER BY a.is_active DESC, a.updated_at DESC, a.created_at DESC
+                """,
+                (chart_number,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+
 def physician_patient_style_history_html(chart_number: str, selected_packet_id: str) -> str:
     conditions = physician_history_rows_from_db(chart_number)
+    allergies = physician_allergy_rows_from_db(chart_number)
 
     existing = {}
     for item in conditions:
@@ -1112,14 +1138,37 @@ def physician_patient_style_history_html(chart_number: str, selected_packet_id: 
             """
         )
 
-    other_html = ""
-    if other_lines:
-        other_html = f"""
-        <div class="card" style="margin-top:20px;">
-          <h2 class="section-title">Other Conditions</h2>
-          <div class="readonly">{html_escape(chr(10).join(other_lines))}</div>
-        </div>
-        """
+    allergy_rows = []
+    total_allergy_rows = max(1, len(allergies))
+
+    for i in range(total_allergy_rows):
+        item = allergies[i] if i < len(allergies) else {}
+        allergen = safe_str(item.get("allergen"))
+        reaction = safe_str(item.get("reaction"))
+        severity = safe_str(item.get("severity")).lower()
+        active_checked = "checked" if allergen and item.get("is_active") is True else ""
+
+        def selected(value: str) -> str:
+            return "selected" if severity == value else ""
+
+        allergy_rows.append(
+            f"""
+            <tr style="background:{'rgba(47,158,143,0.10)' if i % 2 == 0 else 'rgba(255,255,255,0.96)'};">
+              <td><input name="allergy_{i}_allergen" value="{html_escape(allergen)}" placeholder="Allergen" oninput="autoCheckAllergyRow(this)" /></td>
+              <td><input name="allergy_{i}_reaction" value="{html_escape(reaction)}" placeholder="Reaction" /></td>
+              <td>
+                <select name="allergy_{i}_severity">
+                  <option value="" {selected("")}>Select</option>
+                  <option value="mild" {selected("mild")}>Mild</option>
+                  <option value="moderate" {selected("moderate")}>Moderate</option>
+                  <option value="severe" {selected("severe")}>Severe</option>
+                  <option value="life-threatening" {selected("life-threatening")}>Life-threatening</option>
+                </select>
+              </td>
+              <td style="text-align:center;"><input type="checkbox" name="allergy_{i}_active" {active_checked} /></td>
+            </tr>
+            """
+        )
 
     return f"""
       <form method="post" action="/patient/{html_escape(chart_number)}/history?packet_id={html_escape(selected_packet_id)}">
@@ -1151,13 +1200,84 @@ def physician_patient_style_history_html(chart_number: str, selected_packet_id: 
           </table>
         </div>
       </div>
-      {other_html}
+
       <div class="card" style="margin-top:20px;">
-        <button type="submit">Save Medical History</button>
+        <h2 class="section-title">Allergies</h2>
+        <table style="font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;">
+          <thead>
+            <tr>
+              <th>Allergen</th>
+              <th>Reaction</th>
+              <th>Severity</th>
+              <th>Active</th>
+            </tr>
+          </thead>
+          <tbody id="allergies-body">
+            {''.join(allergy_rows)}
+          </tbody>
+        </table>
+
+        <div style="margin-top:18px;display:flex;justify-content:flex-end;">
+          <button type="button" onclick="addAllergyRow()" style="font-size:15px;padding:10px 16px;border-radius:18px;font-weight:800;">
+            Add Another Row
+          </button>
+        </div>
       </div>
+
+      <div class="card" style="margin-top:20px;">
+        <h2 class="section-title">Other Conditions</h2>
+        <textarea
+          name="other_conditions"
+          rows="8"
+          style="width:100%;padding:12px;border-radius:12px;border:1px solid #ccc;font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;font-size:15px;"
+          placeholder="Enter any additional diagnoses or medical conditions here."
+        >{html_escape(chr(10).join(other_lines))}</textarea>
+
+        <div style="margin-top:18px;">
+          <button type="submit" style="font-size:16px;padding:12px 18px;border-radius:18px;font-weight:800;">Save Medical History</button>
+        </div>
+      </div>
+
+      <script>
+        let nextAllergyIndex = {total_allergy_rows};
+
+        function allergySeverityOptions() {{
+          return `
+            <option value="">Select</option>
+            <option value="mild">Mild</option>
+            <option value="moderate">Moderate</option>
+            <option value="severe">Severe</option>
+            <option value="life-threatening">Life-threatening</option>
+          `;
+        }}
+
+        function autoCheckAllergyRow(input) {{
+          const row = input.closest("tr");
+          if (!row) return;
+          const checkbox = row.querySelector("input[type='checkbox']");
+          if (!checkbox) return;
+          if (input.value.trim().length > 0) checkbox.checked = true;
+          if (input.value.trim().length === 0) checkbox.checked = false;
+        }}
+
+        function addAllergyRow() {{
+          const body = document.getElementById("allergies-body");
+          if (!body) return;
+
+          const i = nextAllergyIndex++;
+          const tr = document.createElement("tr");
+          tr.style.background = i % 2 === 0 ? "rgba(47,158,143,0.10)" : "rgba(255,255,255,0.96)";
+          tr.innerHTML = `
+            <td><input name="allergy_${{i}}_allergen" value="" placeholder="Allergen" oninput="autoCheckAllergyRow(this)" /></td>
+            <td><input name="allergy_${{i}}_reaction" value="" placeholder="Reaction" /></td>
+            <td><select name="allergy_${{i}}_severity">${{allergySeverityOptions()}}</select></td>
+            <td style="text-align:center;"><input type="checkbox" name="allergy_${{i}}_active" /></td>
+          `;
+          body.appendChild(tr);
+        }}
+      </script>
       </form>
     """
-
 
 
 @app.post("/patient/{chart_number}/history")
@@ -1172,7 +1292,7 @@ async def save_physician_history(
     if not CALLCARE_SHARED_DATABASE_URL:
         raise HTTPException(status_code=500, detail="Missing shared database URL")
 
-    rows = []
+    condition_rows = []
     for cond in COMMON_HISTORY_CONDITIONS_PHYSICIAN:
         key = cond.lower().replace(" ", "_")
         current_flag = safe_str(form.get(f"{key}_current")).lower() == "on"
@@ -1180,7 +1300,7 @@ async def save_physician_history(
         family_flag = safe_str(form.get(f"{key}_family")).lower() == "on"
 
         if current_flag or past_flag or family_flag:
-            rows.append({
+            condition_rows.append({
                 "condition_name": cond,
                 "current_flag": current_flag,
                 "past_flag": past_flag,
@@ -1193,13 +1313,30 @@ async def save_physician_history(
         for line in other_text.splitlines():
             line = safe_str(line)
             if line:
-                rows.append({
+                condition_rows.append({
                     "condition_name": line,
                     "current_flag": True,
                     "past_flag": False,
                     "family_history_flag": False,
                     "notes": "other_condition_writein",
                 })
+
+    allergy_rows = []
+    for i in range(50):
+        allergen = safe_str(form.get(f"allergy_{i}_allergen")).strip()
+        if not allergen:
+            continue
+
+        reaction = safe_str(form.get(f"allergy_{i}_reaction")).strip()
+        severity = safe_str(form.get(f"allergy_{i}_severity")).strip()
+        active = safe_str(form.get(f"allergy_{i}_active")).lower() == "on"
+
+        allergy_rows.append({
+            "allergen": allergen,
+            "reaction": reaction,
+            "severity": severity,
+            "active": active,
+        })
 
     with psycopg.connect(CALLCARE_SHARED_DATABASE_URL, row_factory=dict_row) as conn:
         with conn.cursor() as cur:
@@ -1229,7 +1366,7 @@ async def save_physician_history(
                 (patient_id,),
             )
 
-            for row in rows:
+            for row in condition_rows:
                 cur.execute(
                     """
                     INSERT INTO callcare.patient_conditions (
@@ -1271,6 +1408,51 @@ async def save_physician_history(
 
             cur.execute(
                 """
+                DELETE FROM callcare.patient_allergies
+                WHERE patient_id = %s::uuid
+                """,
+                (patient_id,),
+            )
+
+            for allergy in allergy_rows:
+                cur.execute(
+                    """
+                    INSERT INTO callcare.patient_allergies (
+                      id,
+                      patient_id,
+                      allergen,
+                      reaction,
+                      severity,
+                      is_active,
+                      source,
+                      verification_status,
+                      created_at,
+                      updated_at
+                    )
+                    VALUES (
+                      gen_random_uuid(),
+                      %s::uuid,
+                      %s,
+                      NULLIF(%s, ''),
+                      NULLIF(%s, ''),
+                      %s,
+                      'physician_portal',
+                      'physician_verified',
+                      now(),
+                      now()
+                    )
+                    """,
+                    (
+                        patient_id,
+                        allergy["allergen"],
+                        allergy["reaction"],
+                        allergy["severity"],
+                        allergy["active"],
+                    ),
+                )
+
+            cur.execute(
+                """
                 INSERT INTO callcare.audit_events (
                   id,
                   actor_type,
@@ -1287,15 +1469,16 @@ async def save_physician_history(
                   NULL,
                   %s::uuid,
                   NULL,
-                  'patient_history_updated_by_physician',
+                  'patient_history_allergies_updated_by_physician',
                   jsonb_build_object(
                     'source', 'physician_portal',
-                    'condition_count', %s
+                    'condition_count', %s,
+                    'allergy_count', %s
                   ),
                   now()
                 )
                 """,
-                (patient_id, len(rows)),
+                (patient_id, len(condition_rows), len(allergy_rows)),
             )
 
         conn.commit()
