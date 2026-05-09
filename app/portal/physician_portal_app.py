@@ -1159,6 +1159,153 @@ def physician_patient_style_history_html(chart_number: str, selected_packet_id: 
     """
 
 
+
+@app.post("/patient/{chart_number}/history")
+async def save_physician_history(
+    chart_number: str,
+    request: Request,
+    packet_id: str = Query(default=""),
+) -> RedirectResponse:
+    require_session(request)
+    form = await request.form()
+
+    if not CALLCARE_SHARED_DATABASE_URL:
+        raise HTTPException(status_code=500, detail="Missing shared database URL")
+
+    rows = []
+    for cond in COMMON_HISTORY_CONDITIONS_PHYSICIAN:
+        key = cond.lower().replace(" ", "_")
+        current_flag = safe_str(form.get(f"{key}_current")).lower() == "on"
+        past_flag = safe_str(form.get(f"{key}_past")).lower() == "on"
+        family_flag = safe_str(form.get(f"{key}_family")).lower() == "on"
+
+        if current_flag or past_flag or family_flag:
+            rows.append({
+                "condition_name": cond,
+                "current_flag": current_flag,
+                "past_flag": past_flag,
+                "family_history_flag": family_flag,
+                "notes": "",
+            })
+
+    other_text = safe_str(form.get("other_conditions"))
+    if other_text:
+        for line in other_text.splitlines():
+            line = safe_str(line)
+            if line:
+                rows.append({
+                    "condition_name": line,
+                    "current_flag": True,
+                    "past_flag": False,
+                    "family_history_flag": False,
+                    "notes": "other_condition_writein",
+                })
+
+    with psycopg.connect(CALLCARE_SHARED_DATABASE_URL, row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id::text AS patient_id
+                FROM callcare.patients
+                WHERE chart_number = %s
+                  AND archived_at IS NULL
+                LIMIT 1
+                """,
+                (chart_number,),
+            )
+            patient = cur.fetchone()
+            if not patient:
+                raise HTTPException(status_code=404, detail="Patient not found")
+
+            patient_id = patient["patient_id"]
+
+            cur.execute(
+                """
+                UPDATE callcare.patient_conditions
+                SET archived_at = now()
+                WHERE patient_id = %s::uuid
+                  AND archived_at IS NULL
+                """,
+                (patient_id,),
+            )
+
+            for row in rows:
+                cur.execute(
+                    """
+                    INSERT INTO callcare.patient_conditions (
+                      id,
+                      patient_id,
+                      condition_name,
+                      current_flag,
+                      past_flag,
+                      family_history_flag,
+                      notes,
+                      source,
+                      verification_status,
+                      created_at,
+                      updated_at
+                    )
+                    VALUES (
+                      gen_random_uuid(),
+                      %s::uuid,
+                      %s,
+                      %s,
+                      %s,
+                      %s,
+                      NULLIF(%s, ''),
+                      'physician_portal',
+                      'physician_verified',
+                      now(),
+                      now()
+                    )
+                    """,
+                    (
+                        patient_id,
+                        row["condition_name"],
+                        row["current_flag"],
+                        row["past_flag"],
+                        row["family_history_flag"],
+                        row["notes"],
+                    ),
+                )
+
+            cur.execute(
+                """
+                INSERT INTO callcare.audit_events (
+                  id,
+                  actor_type,
+                  actor_id,
+                  patient_id,
+                  encounter_id,
+                  event_type,
+                  event_json,
+                  created_at
+                )
+                VALUES (
+                  gen_random_uuid(),
+                  'physician',
+                  NULL,
+                  %s::uuid,
+                  NULL,
+                  'patient_history_updated_by_physician',
+                  jsonb_build_object(
+                    'source', 'physician_portal',
+                    'condition_count', %s
+                  ),
+                  now()
+                )
+                """,
+                (patient_id, len(rows)),
+            )
+
+        conn.commit()
+
+    return RedirectResponse(
+        url=f"/patient/{chart_number}?packet_id={packet_id}&tab=pmh",
+        status_code=303,
+    )
+
+
 @app.get("/patient/{chart_number}", response_class=HTMLResponse)
 async def patient_chart(
     chart_number: str,
