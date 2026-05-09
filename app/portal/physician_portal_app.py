@@ -925,7 +925,7 @@ def physician_history_allergies_form(chart_number: str, packet_id: str) -> str:
         )
 
     allergy_rows = []
-    total_allergy_rows = max(5, len(allergies))
+    total_allergy_rows = max(1, len(allergies))
 
     for i in range(total_allergy_rows):
         item = allergies[i] if i < len(allergies) else {}
@@ -977,7 +977,7 @@ def physician_history_allergies_form(chart_number: str, packet_id: str) -> str:
         </table>
 
         <div style="margin-top:18px;display:flex;justify-content:flex-end;">
-          <button type="button" onclick="addAllergyRow()" style="font-size:15px;padding:10px 16px;border-radius:18px;font-weight:800;">Add Additional Row</button>
+          <button type="button" onclick="addAllergyRow()" style="font-size:15px;padding:10px 16px;border-radius:18px;font-weight:800;">Add Another Row</button>
         </div>
 
         <div style="margin-top:22px;">
