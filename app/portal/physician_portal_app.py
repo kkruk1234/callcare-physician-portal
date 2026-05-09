@@ -2714,7 +2714,7 @@ async def patient_chart(
 
 
 @app.post("/packet/{packet_id}/update-note")
-async def update_note(packet_id: str, request: Request, note_text: str = Form(...)) -> RedirectResponse:
+async def update_note(packet_id: str, request: Request, note_text: str = Form(...), chief_complaint: str = Form(default="")) -> RedirectResponse:
     require_session(request)
 
     row = query_one("SELECT chart_number, signed FROM callcare.portal_packets WHERE packet_id = %s LIMIT 1;", (packet_id,))
