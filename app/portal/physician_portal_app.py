@@ -2066,6 +2066,18 @@ def numeric_or_none(value):
         return None
 
 
+
+def split_pack_text(value):
+    text = safe_str(value).strip()
+    if not text:
+        return None, ""
+
+    try:
+        return float(text), ""
+    except Exception:
+        return None, text
+
+
 def physician_social_form_html(chart_number: str, selected_packet_id: str) -> str:
     social = physician_social_bundle(chart_number)
 
@@ -2327,6 +2339,11 @@ async def save_physician_social(
     tobacco_status = safe_str(form.get("tobacco_status")).strip().lower()
     previous_tobacco_user = True if tobacco_status == "former" else False if tobacco_status in {"never", "current"} else None
 
+    pack_numeric, pack_free_text = split_pack_text(form.get("cigarette_packs_per_day"))
+    nicotine_products = safe_str(form.get("tobacco_products")).strip()
+    if pack_free_text:
+        nicotine_products = (nicotine_products + "; " if nicotine_products else "") + "Pack history: " + pack_free_text
+
     with psycopg.connect(CALLCARE_SHARED_DATABASE_URL, row_factory=dict_row) as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -2367,7 +2384,7 @@ async def save_physician_social(
                   NULLIF(%s, ''),
                   %s,
                   NULLIF(%s, ''),
-                  NULLIF(%s, '')::numeric,
+                  %s,
                   NULLIF(%s, ''),
                   now(),
                   now()
@@ -2385,8 +2402,8 @@ async def save_physician_social(
                     yn(form.get("uses_protection")),
                     safe_str(form.get("protection_type")),
                     previous_tobacco_user,
-                    safe_str(form.get("tobacco_products")),
-                    numeric_or_none(form.get("cigarette_packs_per_day")),
+                    nicotine_products,
+                    pack_numeric,
                     safe_str(form.get("recreational_drug_use")),
                 ),
             )
