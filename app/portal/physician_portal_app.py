@@ -965,7 +965,7 @@ def physician_history_allergies_form(chart_number: str, packet_id: str) -> str:
 
       <div class="card">
         <h2 class="section-title">Other Conditions</h2>
-        <textarea name="other_conditions" rows="8" style="width:100%;border-radius:12px;padding:12px;height:150px;min-height:150px;max-height:150px;resize:vertical;">{html_escape(other_existing)}</textarea>
+        <textarea name="other_conditions" rows="8" style="width:100%;border-radius:12px;padding:12px;resize:vertical;height:150px;min-height:150px;max-height:150px;resize:vertical;">{html_escape(other_existing)}</textarea>
       </div>
 
       <div class="card">
@@ -1890,8 +1890,7 @@ async def save_physician_demographics(
                       postal_code,
                       phone,
                       fax,
-                      created_at,
-                      updated_at
+                      created_at
                     )
                     VALUES (
                       gen_random_uuid(),
@@ -1902,7 +1901,6 @@ async def save_physician_demographics(
                       NULLIF(%s, ''),
                       NULLIF(%s, ''),
                       NULLIF(%s, ''),
-                      now(),
                       now()
                     )
                     RETURNING id::text
