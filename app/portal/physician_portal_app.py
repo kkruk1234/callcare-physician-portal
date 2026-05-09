@@ -939,7 +939,7 @@ def physician_history_allergies_form(chart_number: str, packet_id: str) -> str:
             <tr style="background:{'rgba(47,158,143,0.10)' if i % 2 == 0 else 'rgba(255,255,255,0.96)'};">
               <td><input name="allergy_{i}_allergen" value="{html_escape(allergen)}" placeholder="Allergen" oninput="autoCheckAllergyRow(this)" /></td>
               <td><input name="allergy_{i}_reaction" value="{html_escape(reaction)}" placeholder="Reaction" /></td>
-              <td><select name="allergy_{i}_severity">{allergy_severity_options(severity)}</select></td>
+              <td><select name="allergy_{i}_severity" style="width:100%;padding:12px;border-radius:12px;border:1px solid #ccc;background:white;font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;font-size:15px;">{allergy_severity_options(severity)}</select></td>
               <td style="text-align:center;"><input type="checkbox" name="allergy_{i}_active" {active_checked} /></td>
             </tr>
             """
@@ -1006,7 +1006,7 @@ def physician_history_allergies_form(chart_number: str, packet_id: str) -> str:
             <td><input name="allergy_${{i}}_allergen" placeholder="Allergen" oninput="autoCheckAllergyRow(this)" /></td>
             <td><input name="allergy_${{i}}_reaction" placeholder="Reaction" /></td>
             <td>
-              <select name="allergy_${{i}}_severity">
+              <select name="allergy_${i}_severity" style="width:100%;padding:12px;border-radius:12px;border:1px solid #ccc;background:white;font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;font-size:15px;">
                 <option value="">Select</option>
                 <option value="mild">Mild</option>
                 <option value="moderate">Moderate</option>
@@ -1157,7 +1157,7 @@ def physician_patient_style_history_html(chart_number: str, selected_packet_id: 
               <td><input name="allergy_{i}_allergen" value="{html_escape(allergen)}" placeholder="Allergen" oninput="autoCheckAllergyRow(this)" /></td>
               <td><input name="allergy_{i}_reaction" value="{html_escape(reaction)}" placeholder="Reaction" /></td>
               <td>
-                <select name="allergy_{i}_severity">
+                <select name="allergy_{i}_severity" style="width:100%;padding:12px;border-radius:12px;border:1px solid #ccc;background:white;font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;font-size:15px;">
                   <option value="" {selected("")}>Select</option>
                   <option value="mild" {selected("mild")}>Mild</option>
                   <option value="moderate" {selected("moderate")}>Moderate</option>
@@ -1228,7 +1228,7 @@ def physician_patient_style_history_html(chart_number: str, selected_packet_id: 
         <h2 class="section-title">Other Conditions</h2>
         <textarea
           name="other_conditions"
-          rows="8"
+          rows="10"
           style="width:100%;padding:12px;border-radius:12px;border:1px solid #ccc;font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;font-size:15px;"
           placeholder="Enter any additional diagnoses or medical conditions here."
         >{html_escape(chr(10).join(other_lines))}</textarea>
@@ -1270,7 +1270,7 @@ def physician_patient_style_history_html(chart_number: str, selected_packet_id: 
           tr.innerHTML = `
             <td><input name="allergy_${{i}}_allergen" value="" placeholder="Allergen" oninput="autoCheckAllergyRow(this)" /></td>
             <td><input name="allergy_${{i}}_reaction" value="" placeholder="Reaction" /></td>
-            <td><select name="allergy_${{i}}_severity">${{allergySeverityOptions()}}</select></td>
+            <td><select name="allergy_${i}_severity" style="width:100%;padding:12px;border-radius:12px;border:1px solid #ccc;background:white;font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;font-size:15px;">${{allergySeverityOptions()}}</select></td>
             <td style="text-align:center;"><input type="checkbox" name="allergy_${{i}}_active" /></td>
           `;
           body.appendChild(tr);
