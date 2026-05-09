@@ -680,7 +680,7 @@ def shell(title: str, body: str) -> str:
           }}
           .detail-list {{ margin: 0; padding-left: 18px; }}
           .login-card {{ max-width: 520px; margin: 80px auto 0 auto; }}
-          select {
+          select {{
             width: 100%;
             padding: 12px;
             border-radius: 12px;
@@ -688,7 +688,7 @@ def shell(title: str, body: str) -> str:
             background: white;
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
             font-size: 15px;
-          }
+          }}
 
           input {{
             width: 100%;
