@@ -2069,7 +2069,7 @@ def physician_social_form_html(chart_number: str, selected_packet_id: str) -> st
 
         <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:18px;">
           <div>
-            <label>Current Tobacco / Nicotine Use</label>
+            <label>Tobacco/Nicotine Use</label>
             <select name="tobacco_status">
               {option("", "Select", social.get("tobacco_status"))}
               {option("never", "Never", social.get("tobacco_status"))}
@@ -2079,16 +2079,7 @@ def physician_social_form_html(chart_number: str, selected_packet_id: str) -> st
           </div>
 
           <div>
-            <label>Previous Tobacco User?</label>
-            <select name="previous_tobacco_user">
-              {option("", "Select", social.get("previous_tobacco_user"))}
-              {option("yes", "Yes", social.get("previous_tobacco_user"))}
-              {option("no", "No", social.get("previous_tobacco_user"))}
-            </select>
-          </div>
-
-          <div>
-            <label>Tobacco Products</label>
+            <label>Nicotine Products</label>
             <input name="tobacco_products" value="{html_escape(social.get('tobacco_products'))}" placeholder="Cigarettes, vaping, cigars, chewing tobacco" />
           </div>
 
@@ -2314,12 +2305,24 @@ async def save_physician_social(
     form = await request.form()
     patient_id = physician_patient_id_for_chart(chart_number)
 
+    def yn(value):
+        text = safe_str(value).strip().lower()
+        if text in {"yes", "true", "1", "on"}:
+            return True
+        if text in {"no", "false", "0", "off"}:
+            return False
+        return None
+
+    tobacco_status = safe_str(form.get("tobacco_status")).strip().lower()
+    previous_tobacco_user = True if tobacco_status == "former" else False if tobacco_status in {"never", "current"} else None
+
     with psycopg.connect(CALLCARE_SHARED_DATABASE_URL, row_factory=dict_row) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "DELETE FROM callcare.patient_social_history_structured WHERE patient_id = %s::uuid",
                 (patient_id,),
             )
+
             cur.execute(
                 """
                 INSERT INTO callcare.patient_social_history_structured (
@@ -2361,16 +2364,16 @@ async def save_physician_social(
                 """,
                 (
                     patient_id,
-                    safe_str(form.get("tobacco_status")),
+                    tobacco_status,
                     safe_str(form.get("alcohol_use")),
                     safe_str(form.get("recreational_drug_use")),
                     safe_str(form.get("exercise_level")),
                     safe_str(form.get("occupation")),
-                    form_yes_no_bool(form.get("sexually_active")),
+                    yn(form.get("sexually_active")),
                     safe_str(form.get("sexual_partners_count")),
-                    form_yes_no_bool(form.get("uses_protection")),
+                    yn(form.get("uses_protection")),
                     safe_str(form.get("protection_type")),
-                    form_yes_no_bool(form.get("previous_tobacco_user")),
+                    previous_tobacco_user,
                     safe_str(form.get("tobacco_products")),
                     safe_str(form.get("cigarette_packs_per_day")),
                     safe_str(form.get("recreational_drug_use")),
