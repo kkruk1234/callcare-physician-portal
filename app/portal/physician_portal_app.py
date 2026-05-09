@@ -965,7 +965,7 @@ def physician_history_allergies_form(chart_number: str, packet_id: str) -> str:
 
       <div class="card">
         <h2 class="section-title">Other Conditions</h2>
-        <textarea name="other_conditions" rows="8" style="width:100%;border-radius:12px;padding:12px;resize:vertical;height:150px;min-height:150px;max-height:150px;resize:vertical;">{html_escape(other_existing)}</textarea>
+        <textarea name="other_conditions" rows="8" style="width:100%;border-radius:12px;padding:12px;resize:vertical;resize:vertical;height:120px;min-height:120px;max-height:120px;resize:vertical;">{html_escape(other_existing)}</textarea>
       </div>
 
       <div class="card">
@@ -1981,6 +1981,470 @@ async def save_physician_demographics(
     )
 
 
+
+def physician_patient_id_for_chart(chart_number: str) -> str:
+    if not CALLCARE_SHARED_DATABASE_URL:
+        raise HTTPException(status_code=500, detail="Missing shared database URL")
+
+    with psycopg.connect(CALLCARE_SHARED_DATABASE_URL, row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id::text AS patient_id
+                FROM callcare.patients
+                WHERE chart_number = %s
+                  AND archived_at IS NULL
+                LIMIT 1
+                """,
+                (chart_number,),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Patient not found")
+            return row["patient_id"]
+
+
+def physician_social_bundle(chart_number: str) -> dict:
+    patient_id = physician_patient_id_for_chart(chart_number)
+
+    with psycopg.connect(CALLCARE_SHARED_DATABASE_URL, row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                  tobacco_status,
+                  alcohol_use,
+                  drug_use,
+                  exercise_level,
+                  occupation,
+                  sexually_active,
+                  sexual_partners_count,
+                  uses_protection,
+                  protection_type,
+                  previous_tobacco_user,
+                  tobacco_products,
+                  cigarette_packs_per_day,
+                  recreational_drug_use
+                FROM callcare.patient_social_history_structured
+                WHERE patient_id = %s::uuid
+                ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+                LIMIT 1
+                """,
+                (patient_id,),
+            )
+            return dict(cur.fetchone() or {})
+
+
+def physician_social_form_html(chart_number: str, selected_packet_id: str) -> str:
+    social = physician_social_bundle(chart_number)
+
+    def option(value: str, label: str, current) -> str:
+        selected = "selected" if safe_str(value).lower() == safe_str(current).lower() else ""
+        return f'<option value="{html_escape(value)}" {selected}>{html_escape(label)}</option>'
+
+    return f"""
+    <form method="post" action="/patient/{html_escape(chart_number)}/social?packet_id={html_escape(selected_packet_id)}" autocomplete="off">
+      <div class="card">
+        <h2 class="section-title">Social History</h2>
+
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:18px;">
+          <div>
+            <label>Current Tobacco / Nicotine Use</label>
+            <select name="tobacco_status">
+              {option("", "Select", social.get("tobacco_status"))}
+              {option("never", "Never", social.get("tobacco_status"))}
+              {option("current", "Current", social.get("tobacco_status"))}
+              {option("former", "Former", social.get("tobacco_status"))}
+            </select>
+          </div>
+
+          <div>
+            <label>Previous Tobacco User?</label>
+            <select name="previous_tobacco_user">
+              {option("", "Select", social.get("previous_tobacco_user"))}
+              {option("yes", "Yes", social.get("previous_tobacco_user"))}
+              {option("no", "No", social.get("previous_tobacco_user"))}
+            </select>
+          </div>
+
+          <div>
+            <label>Tobacco Products</label>
+            <input name="tobacco_products" value="{html_escape(social.get('tobacco_products'))}" placeholder="Cigarettes, vaping, cigars, chewing tobacco" />
+          </div>
+
+          <div>
+            <label>Cigarette Packs Per Day</label>
+            <input name="cigarette_packs_per_day" value="{html_escape(social.get('cigarette_packs_per_day'))}" />
+          </div>
+
+          <div>
+            <label>Alcohol Use</label>
+            <select name="alcohol_use">
+              {option("", "Select", social.get("alcohol_use"))}
+              {option("none", "None", social.get("alcohol_use"))}
+              {option("1 drink per day", "1 drink per day", social.get("alcohol_use"))}
+              {option("2 drinks per day", "2 drinks per day", social.get("alcohol_use"))}
+              {option("3+ drinks per day", "3+ drinks per day", social.get("alcohol_use"))}
+            </select>
+          </div>
+
+          <div>
+            <label>Recreational Drug Use</label>
+            <input name="recreational_drug_use" value="{html_escape(social.get('recreational_drug_use') or social.get('drug_use'))}" />
+          </div>
+
+          <div>
+            <label>Exercise</label>
+            <select name="exercise_level">
+              {option("", "Select", social.get("exercise_level"))}
+              {option("0 days/week", "0 days/week", social.get("exercise_level"))}
+              {option("1-2 days/week", "1-2 days/week", social.get("exercise_level"))}
+              {option("3-5 days/week", "3-5 days/week", social.get("exercise_level"))}
+              {option("6-7 days/week", "6-7 days/week", social.get("exercise_level"))}
+            </select>
+          </div>
+
+          <div>
+            <label>Occupation</label>
+            <input name="occupation" value="{html_escape(social.get('occupation'))}" />
+          </div>
+
+          <div>
+            <label>Sexually Active?</label>
+            <select name="sexually_active">
+              {option("", "Select", social.get("sexually_active"))}
+              {option("yes", "Yes", social.get("sexually_active"))}
+              {option("no", "No", social.get("sexually_active"))}
+            </select>
+          </div>
+
+          <div>
+            <label>If sexually active, how many partners do you currently have?</label>
+            <input name="sexual_partners_count" value="{html_escape(social.get('sexual_partners_count'))}" />
+          </div>
+
+          <div>
+            <label>Uses Protection?</label>
+            <select name="uses_protection">
+              {option("", "Select", social.get("uses_protection"))}
+              {option("yes", "Yes", social.get("uses_protection"))}
+              {option("no", "No", social.get("uses_protection"))}
+            </select>
+          </div>
+
+          <div>
+            <label>Protection Type</label>
+            <input name="protection_type" value="{html_escape(social.get('protection_type'))}" />
+          </div>
+        </div>
+
+        <div style="margin-top:18px;">
+          <button type="submit">Save Social History</button>
+        </div>
+      </div>
+    </form>
+    """
+
+
+def physician_medications_bundle(chart_number: str) -> list:
+    patient_id = physician_patient_id_for_chart(chart_number)
+
+    with psycopg.connect(CALLCARE_SHARED_DATABASE_URL, row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                  medication_name,
+                  strength,
+                  dose_instructions,
+                  route,
+                  frequency,
+                  is_current
+                FROM callcare.patient_medications
+                WHERE patient_id = %s::uuid
+                ORDER BY is_current DESC, updated_at DESC, created_at DESC
+                """,
+                (patient_id,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+
+def physician_medications_form_html(chart_number: str, selected_packet_id: str) -> str:
+    meds = physician_medications_bundle(chart_number)
+
+    deduped = []
+    seen = set()
+    for med in meds:
+        key = (
+            safe_str(med.get("medication_name")).lower(),
+            safe_str(med.get("strength") or med.get("dose_instructions")).lower(),
+            safe_str(med.get("route")).lower(),
+            safe_str(med.get("frequency")).lower(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(med)
+
+    total_rows = max(5, len(deduped))
+    rows = []
+
+    for i in range(total_rows):
+        med = deduped[i] if i < len(deduped) else {}
+        name = safe_str(med.get("medication_name"))
+        dose = safe_str(med.get("strength") or med.get("dose_instructions"))
+        route = safe_str(med.get("route")).lower()
+        frequency = safe_str(med.get("frequency"))
+        active_checked = "checked" if name and med.get("is_current") is True else ""
+
+        rows.append(
+            f"""
+            <tr style="background:{'rgba(47,158,143,0.10)' if i % 2 == 0 else 'rgba(255,255,255,0.96)'};">
+              <td><input name="med_{i}_name" value="{html_escape(name)}" placeholder="Medication or supplement name" oninput="autoCheckMedicationRow(this)" /></td>
+              <td><input name="med_{i}_dose" value="{html_escape(dose)}" placeholder="Dose / strength" /></td>
+              <td>
+                <select name="med_{i}_route">
+                  <option value="">Select</option>
+                  <option value="oral" {"selected" if route == "oral" else ""}>Oral</option>
+                  <option value="topical" {"selected" if route == "topical" else ""}>Topical</option>
+                  <option value="injection" {"selected" if route == "injection" else ""}>Injection</option>
+                </select>
+              </td>
+              <td><input name="med_{i}_frequency" value="{html_escape(frequency)}" placeholder="How often?" /></td>
+              <td style="text-align:center;"><input type="checkbox" name="med_{i}_active" {active_checked} /></td>
+            </tr>
+            """
+        )
+
+    return f"""
+    <form method="post" action="/patient/{html_escape(chart_number)}/medications?packet_id={html_escape(selected_packet_id)}" autocomplete="off">
+      <div class="card">
+        <h2 class="section-title">Medications & Supplements</h2>
+
+        <table>
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Dose</th>
+              <th>Route</th>
+              <th>Frequency</th>
+              <th>Active</th>
+            </tr>
+          </thead>
+          <tbody id="medications-body">
+            {''.join(rows)}
+          </tbody>
+        </table>
+
+        <div style="margin-top:18px;display:flex;justify-content:flex-end;">
+          <button type="button" onclick="addMedicationRow()">Add Additional Row</button>
+        </div>
+
+        <div style="margin-top:18px;">
+          <button type="submit">Save Medications</button>
+        </div>
+      </div>
+
+      <script>
+        let nextMedicationIndex = {total_rows};
+
+        function autoCheckMedicationRow(input) {{
+          const row = input.closest("tr");
+          if (!row) return;
+          const checkbox = row.querySelector("input[type='checkbox']");
+          if (!checkbox) return;
+          checkbox.checked = input.value.trim().length > 0;
+        }}
+
+        function addMedicationRow() {{
+          const body = document.getElementById("medications-body");
+          if (!body) return;
+
+          const i = nextMedicationIndex++;
+          const tr = document.createElement("tr");
+          tr.style.background = i % 2 === 0 ? "rgba(47,158,143,0.10)" : "rgba(255,255,255,0.96)";
+          tr.innerHTML = `
+            <td><input name="med_${{i}}_name" placeholder="Medication or supplement name" oninput="autoCheckMedicationRow(this)" /></td>
+            <td><input name="med_${{i}}_dose" placeholder="Dose / strength" /></td>
+            <td>
+              <select name="med_${{i}}_route">
+                <option value="">Select</option>
+                <option value="oral">Oral</option>
+                <option value="topical">Topical</option>
+                <option value="injection">Injection</option>
+              </select>
+            </td>
+            <td><input name="med_${{i}}_frequency" placeholder="How often?" /></td>
+            <td style="text-align:center;"><input type="checkbox" name="med_${{i}}_active" /></td>
+          `;
+          body.appendChild(tr);
+        }}
+      </script>
+    </form>
+    """
+
+
+@app.post("/patient/{chart_number}/social")
+async def save_physician_social(
+    chart_number: str,
+    request: Request,
+    packet_id: str = Query(default=""),
+) -> RedirectResponse:
+    require_session(request)
+    form = await request.form()
+    patient_id = physician_patient_id_for_chart(chart_number)
+
+    with psycopg.connect(CALLCARE_SHARED_DATABASE_URL, row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM callcare.patient_social_history_structured WHERE patient_id = %s::uuid",
+                (patient_id,),
+            )
+            cur.execute(
+                """
+                INSERT INTO callcare.patient_social_history_structured (
+                  patient_id,
+                  tobacco_status,
+                  alcohol_use,
+                  drug_use,
+                  exercise_level,
+                  occupation,
+                  sexually_active,
+                  sexual_partners_count,
+                  uses_protection,
+                  protection_type,
+                  previous_tobacco_user,
+                  tobacco_products,
+                  cigarette_packs_per_day,
+                  recreational_drug_use,
+                  created_at,
+                  updated_at
+                )
+                VALUES (
+                  %s::uuid,
+                  NULLIF(%s, ''),
+                  NULLIF(%s, ''),
+                  NULLIF(%s, ''),
+                  NULLIF(%s, ''),
+                  NULLIF(%s, ''),
+                  NULLIF(%s, ''),
+                  NULLIF(%s, '')::integer,
+                  NULLIF(%s, ''),
+                  NULLIF(%s, ''),
+                  NULLIF(%s, ''),
+                  NULLIF(%s, ''),
+                  NULLIF(%s, '')::numeric,
+                  NULLIF(%s, ''),
+                  now(),
+                  now()
+                )
+                """,
+                (
+                    patient_id,
+                    safe_str(form.get("tobacco_status")),
+                    safe_str(form.get("alcohol_use")),
+                    safe_str(form.get("recreational_drug_use")),
+                    safe_str(form.get("exercise_level")),
+                    safe_str(form.get("occupation")),
+                    safe_str(form.get("sexually_active")),
+                    safe_str(form.get("sexual_partners_count")),
+                    safe_str(form.get("uses_protection")),
+                    safe_str(form.get("protection_type")),
+                    safe_str(form.get("previous_tobacco_user")),
+                    safe_str(form.get("tobacco_products")),
+                    safe_str(form.get("cigarette_packs_per_day")),
+                    safe_str(form.get("recreational_drug_use")),
+                ),
+            )
+
+        conn.commit()
+
+    return RedirectResponse(url=f"/patient/{chart_number}?packet_id={packet_id}&tab=social", status_code=303)
+
+
+@app.post("/patient/{chart_number}/medications")
+async def save_physician_medications(
+    chart_number: str,
+    request: Request,
+    packet_id: str = Query(default=""),
+) -> RedirectResponse:
+    require_session(request)
+    form = await request.form()
+    patient_id = physician_patient_id_for_chart(chart_number)
+
+    rows = []
+    for i in range(50):
+        name = safe_str(form.get(f"med_{i}_name")).strip()
+        if not name:
+            continue
+        rows.append({
+            "name": name,
+            "dose": safe_str(form.get(f"med_{i}_dose")),
+            "route": safe_str(form.get(f"med_{i}_route")),
+            "frequency": safe_str(form.get(f"med_{i}_frequency")),
+            "active": safe_str(form.get(f"med_{i}_active")).lower() == "on",
+        })
+
+    with psycopg.connect(CALLCARE_SHARED_DATABASE_URL, row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM callcare.patient_medications WHERE patient_id = %s::uuid",
+                (patient_id,),
+            )
+
+            for row in rows:
+                cur.execute(
+                    """
+                    INSERT INTO callcare.patient_medications (
+                      id,
+                      patient_id,
+                      medication_name,
+                      strength,
+                      dose_instructions,
+                      route,
+                      frequency,
+                      is_current,
+                      start_date,
+                      end_date,
+                      source,
+                      verification_status,
+                      created_at,
+                      updated_at
+                    )
+                    VALUES (
+                      gen_random_uuid(),
+                      %s::uuid,
+                      %s,
+                      NULLIF(%s, ''),
+                      NULLIF(%s, ''),
+                      NULLIF(%s, ''),
+                      NULLIF(%s, ''),
+                      %s,
+                      CURRENT_DATE,
+                      CASE WHEN %s THEN NULL ELSE CURRENT_DATE END,
+                      'physician_portal',
+                      'physician_verified',
+                      now(),
+                      now()
+                    )
+                    """,
+                    (
+                        patient_id,
+                        row["name"],
+                        row["dose"],
+                        row["dose"],
+                        row["route"],
+                        row["frequency"],
+                        row["active"],
+                        row["active"],
+                    ),
+                )
+
+        conn.commit()
+
+    return RedirectResponse(url=f"/patient/{chart_number}?packet_id={packet_id}&tab=medications", status_code=303)
+
+
 @app.get("/patient/{chart_number}", response_class=HTMLResponse)
 async def patient_chart(
     chart_number: str,
@@ -2048,12 +2512,8 @@ async def patient_chart(
     )
 
     pmh_panel = physician_patient_style_history_html(chart_number, selected_packet_id)
-    social_panel = f"""
-      <div class="card">
-        <h2 class="section-title">Past Social History</h2>
-        {social_html}
-      </div>
-    """
+    social_panel = physician_social_form_html(chart_number, selected_packet_id)
+    medications_panel = physician_medications_form_html(chart_number, selected_packet_id)
 
     note_editor_html = (
         f"""
@@ -2161,6 +2621,7 @@ async def patient_chart(
         "demographics": demographics_panel,
         "pmh": pmh_panel,
         "social": social_panel,
+        "medications": medications_panel,
         "encounters": encounter_panel,
     }.get(tab, encounter_panel)
 
@@ -2184,6 +2645,7 @@ async def patient_chart(
           {tab_link("demographics", "Demographics & Pharmacy")}
           {tab_link("pmh", "Medical History")}
           {tab_link("social", "Social History")}
+          {tab_link("medications", "Medications")}
           {tab_link("encounters", "Encounters")}
         </div>
 
