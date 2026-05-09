@@ -1934,15 +1934,13 @@ async def save_physician_demographics(
                       patient_id,
                       pharmacy_id,
                       is_preferred,
-                      created_at,
-                      updated_at
+                      created_at
                     )
                     VALUES (
                       gen_random_uuid(),
                       %s::uuid,
                       %s::uuid,
                       true,
-                      now(),
                       now()
                     )
                     """,
