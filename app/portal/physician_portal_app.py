@@ -680,6 +680,16 @@ def shell(title: str, body: str) -> str:
           }}
           .detail-list {{ margin: 0; padding-left: 18px; }}
           .login-card {{ max-width: 520px; margin: 80px auto 0 auto; }}
+          select {
+            width: 100%;
+            padding: 12px;
+            border-radius: 12px;
+            border: 1px solid #ccc;
+            background: white;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+            font-size: 15px;
+          }
+
           input {{
             width: 100%;
             padding: 12px;
@@ -2004,6 +2014,16 @@ def physician_patient_id_for_chart(chart_number: str) -> str:
             return row["patient_id"]
 
 
+
+def form_yes_no_bool(value):
+    text = safe_str(value).strip().lower()
+    if text in {"yes", "true", "1", "on"}:
+        return True
+    if text in {"no", "false", "0", "off"}:
+        return False
+    return None
+
+
 def physician_social_bundle(chart_number: str) -> dict:
     patient_id = physician_patient_id_for_chart(chart_number)
 
@@ -2327,11 +2347,11 @@ async def save_physician_social(
                   NULLIF(%s, ''),
                   NULLIF(%s, ''),
                   NULLIF(%s, ''),
-                  NULLIF(%s, ''),
+                  %s,
                   NULLIF(%s, '')::integer,
+                  %s,
                   NULLIF(%s, ''),
-                  NULLIF(%s, ''),
-                  NULLIF(%s, ''),
+                  %s,
                   NULLIF(%s, ''),
                   NULLIF(%s, '')::numeric,
                   NULLIF(%s, ''),
@@ -2346,11 +2366,11 @@ async def save_physician_social(
                     safe_str(form.get("recreational_drug_use")),
                     safe_str(form.get("exercise_level")),
                     safe_str(form.get("occupation")),
-                    safe_str(form.get("sexually_active")),
+                    form_yes_no_bool(form.get("sexually_active")),
                     safe_str(form.get("sexual_partners_count")),
-                    safe_str(form.get("uses_protection")),
+                    form_yes_no_bool(form.get("uses_protection")),
                     safe_str(form.get("protection_type")),
-                    safe_str(form.get("previous_tobacco_user")),
+                    form_yes_no_bool(form.get("previous_tobacco_user")),
                     safe_str(form.get("tobacco_products")),
                     safe_str(form.get("cigarette_packs_per_day")),
                     safe_str(form.get("recreational_drug_use")),
