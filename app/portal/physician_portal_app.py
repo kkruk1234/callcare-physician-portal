@@ -965,7 +965,7 @@ def physician_history_allergies_form(chart_number: str, packet_id: str) -> str:
 
       <div class="card">
         <h2 class="section-title">Other Conditions</h2>
-        <textarea name="other_conditions" rows="6" style="width:100%;border-radius:12px;padding:12px;">{html_escape(other_existing)}</textarea>
+        <textarea name="other_conditions" rows="8" style="width:100%;border-radius:12px;padding:12px;height:150px;min-height:150px;max-height:150px;resize:vertical;">{html_escape(other_existing)}</textarea>
       </div>
 
       <div class="card">
@@ -1756,6 +1756,231 @@ async def save_physician_history(
 
     return RedirectResponse(
         url=f"/patient/{chart_number}?packet_id={packet_id}&tab=pmh",
+        status_code=303,
+    )
+
+
+
+@app.post("/patient/{chart_number}/demographics")
+async def save_physician_demographics(
+    chart_number: str,
+    request: Request,
+    packet_id: str = Query(default=""),
+) -> RedirectResponse:
+    require_session(request)
+    form = await request.form()
+
+    if not CALLCARE_SHARED_DATABASE_URL:
+        raise HTTPException(status_code=500, detail="Missing shared database URL")
+
+    with psycopg.connect(CALLCARE_SHARED_DATABASE_URL, row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id::text AS patient_id
+                FROM callcare.patients
+                WHERE chart_number = %s
+                  AND archived_at IS NULL
+                LIMIT 1
+                """,
+                (chart_number,),
+            )
+            patient = cur.fetchone()
+            if not patient:
+                raise HTTPException(status_code=404, detail="Patient not found")
+
+            patient_id = patient["patient_id"]
+
+            cur.execute(
+                """
+                UPDATE callcare.patients
+                SET
+                  preferred_name = NULLIF(%s, ''),
+                  sex_at_birth = NULLIF(%s, ''),
+                  gender_identity = NULLIF(%s, ''),
+                  phone_number = NULLIF(%s, ''),
+                  email = NULLIF(%s, '')
+                WHERE id = %s::uuid
+                """,
+                (
+                    safe_str(form.get("preferred_name")),
+                    safe_str(form.get("sex_at_birth")),
+                    safe_str(form.get("gender_identity")),
+                    safe_str(form.get("phone_number")),
+                    safe_str(form.get("email")),
+                    patient_id,
+                ),
+            )
+
+            cur.execute(
+                """
+                INSERT INTO callcare.patient_addresses (
+                  id,
+                  patient_id,
+                  address_line_1,
+                  address_line_2,
+                  city,
+                  state,
+                  postal_code,
+                  county_name
+                )
+                VALUES (
+                  gen_random_uuid(),
+                  %s::uuid,
+                  %s,
+                  NULLIF(%s, ''),
+                  %s,
+                  %s,
+                  %s,
+                  NULLIF(%s, '')
+                )
+                """,
+                (
+                    patient_id,
+                    safe_str(form.get("address_line_1")) or "Not provided",
+                    safe_str(form.get("address_line_2")),
+                    safe_str(form.get("city")) or "Not provided",
+                    safe_str(form.get("state")) or "GA",
+                    safe_str(form.get("postal_code")) or "00000",
+                    safe_str(form.get("county_name")),
+                ),
+            )
+
+            cur.execute(
+                """
+                INSERT INTO callcare.patient_vitals (
+                  id,
+                  patient_id,
+                  height_feet,
+                  height_inches,
+                  weight_lbs,
+                  source,
+                  created_at,
+                  updated_at
+                )
+                VALUES (
+                  gen_random_uuid(),
+                  %s::uuid,
+                  NULLIF(%s, '')::integer,
+                  NULLIF(%s, '')::integer,
+                  NULLIF(%s, '')::numeric,
+                  'physician_portal',
+                  now(),
+                  now()
+                )
+                """,
+                (
+                    patient_id,
+                    safe_str(form.get("height_feet")),
+                    safe_str(form.get("height_inches")),
+                    safe_str(form.get("weight_lbs")),
+                ),
+            )
+
+            pharmacy_name = safe_str(form.get("pharmacy_name"))
+            if pharmacy_name:
+                cur.execute(
+                    """
+                    INSERT INTO callcare.pharmacies (
+                      id,
+                      name,
+                      address_line_1,
+                      city,
+                      state,
+                      postal_code,
+                      phone,
+                      fax,
+                      created_at,
+                      updated_at
+                    )
+                    VALUES (
+                      gen_random_uuid(),
+                      %s,
+                      NULLIF(%s, ''),
+                      NULLIF(%s, ''),
+                      NULLIF(%s, ''),
+                      NULLIF(%s, ''),
+                      NULLIF(%s, ''),
+                      NULLIF(%s, ''),
+                      now(),
+                      now()
+                    )
+                    RETURNING id::text
+                    """,
+                    (
+                        pharmacy_name,
+                        safe_str(form.get("pharmacy_address_line_1")),
+                        safe_str(form.get("pharmacy_city")),
+                        safe_str(form.get("pharmacy_state")),
+                        safe_str(form.get("pharmacy_postal_code")),
+                        safe_str(form.get("pharmacy_phone")),
+                        safe_str(form.get("pharmacy_fax")),
+                    ),
+                )
+                pharmacy = cur.fetchone()
+                pharmacy_id = pharmacy["id"]
+
+                cur.execute(
+                    """
+                    UPDATE callcare.patient_pharmacies
+                    SET is_preferred = false
+                    WHERE patient_id = %s::uuid
+                    """,
+                    (patient_id,),
+                )
+
+                cur.execute(
+                    """
+                    INSERT INTO callcare.patient_pharmacies (
+                      id,
+                      patient_id,
+                      pharmacy_id,
+                      is_preferred,
+                      created_at,
+                      updated_at
+                    )
+                    VALUES (
+                      gen_random_uuid(),
+                      %s::uuid,
+                      %s::uuid,
+                      true,
+                      now(),
+                      now()
+                    )
+                    """,
+                    (patient_id, pharmacy_id),
+                )
+
+            cur.execute(
+                """
+                INSERT INTO callcare.audit_events (
+                  id,
+                  actor_type,
+                  actor_id,
+                  patient_id,
+                  encounter_id,
+                  event_type,
+                  event_json,
+                  created_at
+                )
+                VALUES (
+                  gen_random_uuid(),
+                  'physician',
+                  NULL,
+                  %s::uuid,
+                  NULL,
+                  'patient_demographics_pharmacy_updated_by_physician',
+                  jsonb_build_object('source', 'physician_portal'),
+                  now()
+                )
+                """,
+                (patient_id,),
+            )
+
+        conn.commit()
+
+    return RedirectResponse(
+        url=f"/patient/{chart_number}?packet_id={packet_id}&tab=demographics",
         status_code=303,
     )
 
