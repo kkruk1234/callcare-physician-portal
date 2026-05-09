@@ -4,38 +4,19 @@ import json
 import os
 import secrets
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import psycopg
 import requests
 from psycopg.rows import dict_row
-
-from fastapi import FastAPI, Form, HTTPException, Query, Request
+from fastapi import FastAPI, Form, HTTPException, Query, Request, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
-
-from app.portal.portal_common import (
-    add_signed_addendum,
-    addendum_block,
-    encounter_when,
-    html_escape,
-    load_json,
-    load_meta,
-    packet_bundle,
-    packet_path,
-    patient_groups,
-    queue_or_send_new_note_email,
-    save_json,
-    save_meta,
-    safe_str,
-    save_note_signed,
-    signed_note_text,
-)
 
 app = FastAPI(title="CallCare Physician Portal")
 
-CALLCARE_PUBLIC_BASE_URL = os.getenv("CALLCARE_PUBLIC_BASE_URL", "https://callcare.healthcare").rstrip("/")
 CALLCARE_SHARED_DATABASE_URL = os.getenv("CALLCARE_SHARED_DATABASE_URL", "").strip()
+CALLCARE_PUBLIC_BASE_URL = os.getenv("CALLCARE_PUBLIC_BASE_URL", "https://callcare.healthcare").rstrip("/")
 CALLCARE_EMAIL_PROVIDER = os.getenv("CALLCARE_EMAIL_PROVIDER", "").strip().lower()
 CALLCARE_RESEND_API_KEY = os.getenv("CALLCARE_RESEND_API_KEY", "").strip()
 CALLCARE_PHYSICIAN_USERNAME = os.getenv("CALLCARE_PHYSICIAN_USERNAME", "").strip()
@@ -43,35 +24,52 @@ CALLCARE_PHYSICIAN_PASSWORD = os.getenv("CALLCARE_PHYSICIAN_PASSWORD", "").strip
 
 SESSIONS: Dict[str, Dict[str, str]] = {}
 
-COMMON_HISTORY_CONDITIONS = [
-    "Hypertension", "Diabetes", "High Cholesterol", "Coronary Artery Disease",
-    "Heart Failure", "Atrial Fibrillation", "Stroke", "COPD", "Asthma",
-    "Sleep Apnea", "GERD", "Peptic Ulcer Disease", "Irritable Bowel Syndrome",
-    "Crohn Disease", "Ulcerative Colitis", "Chronic Kidney Disease",
-    "Kidney Stones", "Migraines", "Seizure Disorder", "Depression", "Anxiety",
-    "Bipolar Disorder", "PTSD", "ADHD", "Hypothyroidism", "Hyperthyroidism",
-    "Obesity", "Osteoarthritis", "Rheumatoid Arthritis", "Fibromyalgia",
-    "Osteoporosis", "Chronic Back Pain", "Anemia", "Cancer", "Breast Cancer",
-    "Colon Cancer", "Prostate Cancer", "Skin Cancer", "Liver Disease",
-    "Hepatitis", "HIV", "Peripheral Neuropathy", "Dementia", "Parkinson Disease",
-    "Glaucoma", "Macular Degeneration", "Seasonal Allergies", "Eczema",
-    "Psoriasis", "Gout",
-]
+
+def safe_str(x: Any) -> str:
+    try:
+        return str(x if x is not None else "").strip()
+    except Exception:
+        return ""
+
+
+def html_escape(s: Any) -> str:
+    text = safe_str(s)
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def shared_db_url() -> str:
-    return CALLCARE_SHARED_DATABASE_URL
+def db_conn():
+    if not CALLCARE_SHARED_DATABASE_URL:
+        raise RuntimeError("CALLCARE_SHARED_DATABASE_URL is not set")
+    return psycopg.connect(CALLCARE_SHARED_DATABASE_URL, row_factory=dict_row)
 
 
-def db_connect():
-    url = shared_db_url()
-    if not url:
-        raise HTTPException(status_code=500, detail="Missing CALLCARE_SHARED_DATABASE_URL")
-    return psycopg.connect(url, row_factory=dict_row)
+def query_all(sql: str, params: tuple = ()) -> List[Dict[str, Any]]:
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+            return [dict(r) for r in rows]
+
+
+def query_one(sql: str, params: tuple = ()) -> Optional[Dict[str, Any]]:
+    rows = query_all(sql, params)
+    return rows[0] if rows else None
+
+
+def execute(sql: str, params: tuple = ()) -> None:
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+        conn.commit()
 
 
 def make_session_token() -> str:
@@ -92,11 +90,470 @@ def require_session(request: Request) -> Dict[str, str]:
     return sess
 
 
-def shell(title: str, body: str) -> str:
+PORTAL_TIMEZONE = ZoneInfo("America/New_York")
+
+
+def format_portal_time(value: Any) -> str:
+    text = safe_str(value)
+    if not text:
+        return ""
+
+    normalized = text.replace("T", " ").replace("Z", "+00:00")
+
+    try:
+        dt = datetime.fromisoformat(normalized)
+    except Exception:
+        try:
+            dt = datetime.strptime(normalized[:19], "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return text.split(".")[0]
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+
+    return dt.astimezone(PORTAL_TIMEZONE).strftime("%Y-%m-%d %I:%M:%S %p %Z")
+
+
+def signed_note_text(note_text: str, meta: Dict[str, Any]) -> str:
+    text = safe_str(note_text)
+    if not meta.get("signed"):
+        return text
+    signed_at = format_portal_time(meta.get("signed_at"))
+    signed_by = safe_str(meta.get("signed_by"))
+    stamp = f"\n\nSigned electronically by {signed_by} on {signed_at}"
+    existing_prefix = f"Signed electronically by {signed_by} on "
+    if existing_prefix in text:
+        return text
+    return text + stamp
+
+
+def addendum_block(addendum: Dict[str, Any]) -> str:
+    text = safe_str(addendum.get("text"))
+    signed_at = format_portal_time(addendum.get("signed_at"))
+    signed_by = safe_str(addendum.get("signed_by"))
+    return f"{text}\n\nSigned addendum by {signed_by} on {signed_at}"
+
+
+def encounter_when(dt_text: str) -> str:
+    return format_portal_time(dt_text)
+
+
+def render_list_items(items: List[Dict[str, Any]], keys: List[str], empty_text: str) -> str:
+    if not items:
+        return f"<p>{html_escape(empty_text)}</p>"
+    rendered = []
+    for item in items:
+        parts = []
+        for k in keys:
+            val = safe_str(item.get(k))
+            if val:
+                parts.append(val)
+        if parts:
+            rendered.append(f"<li>{html_escape(' — '.join(parts))}</li>")
+    if not rendered:
+        return f"<p>{html_escape(empty_text)}</p>"
+    return "<ul class='detail-list'>" + "".join(rendered) + "</ul>"
+
+
+
+def render_structured_pmh(items) -> str:
+    if not items:
+        return "<p>No past medical history on file.</p>"
+
+    seen = set()
+    rows = []
+
+    for item in items:
+        name = safe_str(item.get("condition_name"))
+        if not name:
+            continue
+
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+
+        current = "✓" if item.get("current_flag") else ""
+        past = "✓" if item.get("past_flag") else ""
+        family = "✓" if item.get("family_history_flag") else ""
+
+        rows.append(
+            f"""
+            <tr>
+              <td>{html_escape(name)}</td>
+              <td style="text-align:center;">{current}</td>
+              <td style="text-align:center;">{past}</td>
+              <td style="text-align:center;">{family}</td>
+            </tr>
+            """
+        )
+
+    if not rows:
+        return "<p>No past medical history on file.</p>"
+
     return f"""
+    <table>
+      <thead>
+        <tr>
+          <th>Condition</th>
+          <th>Current</th>
+          <th>Past</th>
+          <th>Family History</th>
+        </tr>
+      </thead>
+      <tbody>
+        {''.join(rows)}
+      </tbody>
+    </table>
+    """
+
+
+def render_pharmacy(ph: Optional[Dict[str, Any]]) -> str:
+    if not ph:
+        return "<p>No preferred pharmacy on file.</p>"
+    parts = [
+        safe_str(ph.get("name")),
+        safe_str(ph.get("address_line_1")),
+        " ".join(
+            x for x in [
+                safe_str(ph.get("city")),
+                safe_str(ph.get("state")),
+                safe_str(ph.get("postal_code")),
+            ] if x
+        ).strip(),
+        safe_str(ph.get("phone")),
+        safe_str(ph.get("fax")),
+        safe_str(ph.get("ncpdp_id")),
+    ]
+    parts = [p for p in parts if p]
+    return "<ul class='detail-list'>" + "".join(f"<li>{html_escape(p)}</li>" for p in parts) + "</ul>"
+
+
+def extract_encounter_label(note_text: str, fallback: str) -> str:
+    text = safe_str(note_text)
+    lower_text = text.lower()
+    marker = "the working diagnosis is "
+    likely_marker = " likely"
+
+    start = lower_text.find(marker)
+    if start != -1:
+        start += len(marker)
+        end = lower_text.find(likely_marker, start)
+        if end != -1:
+            diagnosis = text[start:end].strip(" .:-")
+            if diagnosis:
+                return diagnosis[:1].upper() + diagnosis[1:]
+
+    diff_marker = "Differential:"
+    if diff_marker in text:
+        tail = text.split(diff_marker, 1)[1]
+        for line in tail.splitlines():
+            s = safe_str(line)
+            if s.startswith("1."):
+                s = s[2:].strip()
+                if s:
+                    s = s[:1].lower() + s[1:]
+                    return "Possible " + s
+
+    f = safe_str(fallback).strip().rstrip(".")
+    for prefix in ("i have ", "i'm having ", "im having ", "i am having ", "my "):
+        if f.lower().startswith(prefix):
+            f = f[len(prefix):].strip()
+            break
+    if not f:
+        return "Encounter"
+    return f[:1].upper() + f[1:]
+
+
+def patient_groups() -> List[Dict[str, Any]]:
+    sql = """
+    WITH latest AS (
+      SELECT DISTINCT ON (pp.chart_number)
+        pp.chart_number,
+        pp.packet_id,
+        pp.created_at,
+        pp.chief_complaint,
+        pp.note_text,
+        pp.status,
+        pp.prescription_status,
+        pp.note_sent,
+        p.legal_first_name,
+        p.legal_last_name
+      FROM callcare.portal_packets pp
+      JOIN callcare.patients p
+        ON p.id = pp.patient_id
+      ORDER BY pp.chart_number, pp.created_at DESC
+    )
+    SELECT
+      l.chart_number,
+      trim(concat_ws(' ', l.legal_first_name, l.legal_last_name)) AS patient_name,
+      l.packet_id,
+      l.created_at::text AS created_at,
+      l.chief_complaint,
+      l.note_text,
+      l.status,
+      l.prescription_status,
+      l.note_sent
+    FROM latest l
+    ORDER BY l.created_at DESC;
+    """
+    rows = query_all(sql)
+    groups: List[Dict[str, Any]] = []
+    for row in rows:
+        groups.append(
+            {
+                "chart_number": safe_str(row.get("chart_number")),
+                "patient_name": safe_str(row.get("patient_name")),
+                "encounters": [
+                    {
+                        "packet_id": safe_str(row.get("packet_id")),
+                        "created_at": safe_str(row.get("created_at")),
+                        "packet": {
+                            "packet_id": safe_str(row.get("packet_id")),
+                            "note_text": safe_str(row.get("note_text")),
+                            "created_at": safe_str(row.get("created_at")),
+                        },
+                        "meta": {
+                            "status": safe_str(row.get("status")),
+                            "prescription_status": safe_str(row.get("prescription_status")),
+                            "note_sent": safe_str(row.get("note_sent")),
+                        },
+                        "patient_ctx": {
+                            "chart_number": safe_str(row.get("chart_number")),
+                            "patient_name": safe_str(row.get("patient_name")),
+                            "chief_complaint": safe_str(row.get("chief_complaint")),
+                        },
+                    }
+                ],
+            }
+        )
+    return groups
+
+
+def get_patient_context(chart_number: str) -> Optional[Dict[str, Any]]:
+    sql = """
+    SELECT
+      p.id::text AS patient_id,
+      p.chart_number,
+      trim(concat_ws(' ', p.legal_first_name, p.legal_last_name)) AS patient_name,
+      p.date_of_birth::text AS date_of_birth,
+      p.sex_at_birth,
+      p.phone_number,
+      p.email
+    FROM callcare.patients p
+    WHERE p.chart_number = %s
+    LIMIT 1;
+    """
+    ctx = query_one(sql, (chart_number,))
+    if not ctx:
+        return None
+
+    patient_id = safe_str(ctx.get("patient_id"))
+
+    ph_sql = """
+    SELECT
+      ph.name,
+      ph.address_line_1,
+      ph.city,
+      ph.state,
+      ph.postal_code,
+      ph.phone,
+      ph.fax,
+      ph.ncpdp_id
+    FROM callcare.patient_pharmacies pp
+    JOIN callcare.pharmacies ph
+      ON ph.id = pp.pharmacy_id
+    WHERE pp.patient_id = %s::uuid
+      AND pp.is_preferred = true
+    ORDER BY ph.created_at DESC
+    LIMIT 1;
+    """
+    ctx["preferred_pharmacy"] = query_one(ph_sql, (patient_id,))
+
+    allergies_sql = """
+    SELECT allergen, reaction, severity
+    FROM callcare.patient_allergies
+    WHERE patient_id = %s::uuid
+      AND is_active = true
+    ORDER BY created_at;
+    """
+    ctx["allergies"] = query_all(allergies_sql, (patient_id,))
+
+    conditions_sql = """
+    SELECT condition_name, status
+    FROM callcare.patient_conditions
+    WHERE patient_id = %s::uuid
+    ORDER BY created_at;
+    """
+    ctx["conditions"] = query_all(conditions_sql, (patient_id,))
+
+    social_sql = """
+    SELECT domain, value_text
+    FROM callcare.patient_social_history
+    WHERE patient_id = %s::uuid
+    ORDER BY created_at;
+    """
+    ctx["social_history"] = query_all(social_sql, (patient_id,))
+
+    return ctx
+
+
+def get_encounters(chart_number: str) -> List[Dict[str, Any]]:
+    patient_ctx = get_patient_context(chart_number)
+    if not patient_ctx:
+        return []
+
+    sql = """
+    SELECT
+      packet_id,
+      chart_number,
+      created_at::text AS created_at,
+      chief_complaint,
+      note_text,
+      spoken_summary,
+      COALESCE(spoken_summary_comments, '') AS spoken_summary_comments,
+      status,
+      prescription_status,
+      note_sent,
+      signed,
+      signed_at::text AS signed_at,
+      signed_by,
+      COALESCE(addenda, '[]'::jsonb) AS addenda
+    FROM callcare.portal_packets
+    WHERE chart_number = %s
+    ORDER BY created_at DESC;
+    """
+    rows = query_all(sql, (chart_number,))
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        out.append(
+            {
+                "packet_id": safe_str(row.get("packet_id")),
+                "created_at": safe_str(row.get("created_at")),
+                "spoken_summary": safe_str(row.get("spoken_summary")),
+                "packet": {
+                    "packet_id": safe_str(row.get("packet_id")),
+                    "note_text": safe_str(row.get("note_text")),
+                    "created_at": safe_str(row.get("created_at")),
+                },
+                "meta": {
+                    "signed": bool(row.get("signed")),
+                    "signed_at": safe_str(row.get("signed_at")),
+                    "signed_by": safe_str(row.get("signed_by")),
+                    "status": safe_str(row.get("status")),
+                    "prescription_status": safe_str(row.get("prescription_status")),
+                    "note_sent": safe_str(row.get("note_sent")),
+                    "spoken_summary_comments": safe_str(row.get("spoken_summary_comments")),
+                    "addenda": row.get("addenda") or [],
+                },
+                "patient_ctx": {
+                    **patient_ctx,
+                    "chief_complaint": safe_str(row.get("chief_complaint")),
+                    "encounter_started_at": safe_str(row.get("created_at")),
+                },
+            }
+        )
+    return out
+
+
+def queue_or_send_new_note_email(packet_id: str, patient_ctx: dict, reason: str = "note_ready") -> dict:
+    to_email = safe_str(patient_ctx.get("email"))
+    patient_name = safe_str(patient_ctx.get("patient_name")) or "Patient"
+    portal_url = f"{CALLCARE_PUBLIC_BASE_URL}/portal/login"
+
+    if reason == "addendum":
+        subject = "A CallCare note was updated"
+        plain = (
+            f"Hello {patient_name},\n\n"
+            f"A physician updated a note in your CallCare patient portal.\n\n"
+            f"Please log in to review the updated note:\n{portal_url}\n"
+        )
+        headline = "A physician updated your note"
+        body_line = "A physician made a change to a note in your CallCare patient portal."
+    else:
+        subject = "A new CallCare note is available"
+        plain = (
+            f"Hello {patient_name},\n\n"
+            f"A new CallCare note is available in your CallCare patient portal.\n\n"
+            f"Please log in to review it:\n{portal_url}\n"
+        )
+        headline = "A new CallCare note is available"
+        body_line = "A new physician-reviewed note is ready in your CallCare patient portal."
+
+    html_body = f"""
+    <html>
+      <body style="margin:0;padding:0;background:#eef7f5;font-family:Arial,sans-serif;color:#173430;">
+        <div style="max-width:620px;margin:32px auto;padding:0 16px;">
+          <div style="background:linear-gradient(135deg,#1f8f80,#67b9ae);color:white;border-radius:24px;padding:30px 32px;">
+            <div style="font-size:38px;font-weight:800;letter-spacing:-0.03em;">CallCare</div>
+            <div style="margin-top:10px;font-size:16px;line-height:1.55;">Telephone-first medical care for rural communities.</div>
+          </div>
+
+          <div style="background:white;border-radius:24px;padding:30px 32px;margin-top:18px;border:1px solid #d7e7e3;box-shadow:0 10px 30px rgba(18,60,55,0.08);">
+            <div style="font-size:25px;font-weight:700;color:#163133;">{headline}</div>
+
+            <p style="font-size:16px;line-height:1.65;margin-top:18px;">Hello {html_escape(patient_name)},</p>
+
+            <p style="font-size:16px;line-height:1.65;">{body_line}</p>
+
+            <div style="margin-top:24px;">
+              <a href="{portal_url}" style="display:inline-block;background:linear-gradient(135deg,#1f8f80,#67b9ae);color:white;text-decoration:none;font-weight:700;padding:14px 18px;border-radius:12px;">
+                Go to Patient Portal
+              </a>
+            </div>
+
+            <p style="font-size:14px;line-height:1.65;color:#47655f;margin-top:22px;">
+              Direct link: <a href="{portal_url}" style="color:#1f8f80;">{portal_url}</a>
+            </p>
+          </div>
+        </div>
+      </body>
+    </html>
+    """
+
+    payload = {"sent": False}
+
+    if not to_email:
+        payload["error"] = "No patient email on file"
+        return payload
+
+    if CALLCARE_EMAIL_PROVIDER == "resend":
+        if not CALLCARE_RESEND_API_KEY:
+            payload["error"] = "Missing RESEND API key"
+            return payload
+        try:
+            resp = requests.post(
+                "https://api.resend.com/emails",
+                headers={
+                    "Authorization": f"Bearer {CALLCARE_RESEND_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "from": "CallCare <onboarding@resend.dev>",
+                    "to": [to_email],
+                    "subject": subject,
+                    "text": plain,
+                    "html": html_body,
+                },
+                timeout=20,
+            )
+            if 200 <= resp.status_code < 300:
+                payload["sent"] = True
+            else:
+                payload["error"] = safe_str(resp.text)
+        except Exception as e:
+            payload["error"] = safe_str(e)
+    else:
+        payload["error"] = "Unsupported email provider"
+    return payload
+
+
+def shell(title: str, body: str) -> str:
+    template = """
     <html>
       <head>
-        <title>{html_escape(title)}</title>
+        <title>{title}</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
         <style>
           :root {{
             --bg: #f3f8f7;
@@ -135,9 +592,10 @@ def shell(title: str, body: str) -> str:
             padding: 22px;
             box-shadow: 0 10px 28px rgba(18, 40, 42, 0.06);
           }}
+          .list-card {{ overflow: hidden; }}
           table {{ width: 100%; border-collapse: collapse; }}
-          th, td {{ padding: 12px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }}
-          th {{ color: var(--muted); font-weight: 700; font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; }}
+          th, td {{ padding: 14px 12px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }}
+          th {{ color: var(--muted); font-weight: 600; font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; }}
           tr:last-child td {{ border-bottom: 0; }}
           a {{ color: var(--accent); text-decoration: none; }}
           .tabs {{ display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 18px; }}
@@ -148,7 +606,6 @@ def shell(title: str, body: str) -> str:
             border-radius: 999px;
             padding: 10px 16px;
             color: var(--ink);
-            font-weight: 700;
           }}
           .tab.active {{
             background: linear-gradient(135deg, var(--accent), var(--accent2));
@@ -177,6 +634,14 @@ def shell(title: str, body: str) -> str:
             gap: 14px;
             margin-bottom: 20px;
           }}
+          .pill {{
+            display: inline-block;
+            padding: 8px 12px;
+            border-radius: 999px;
+            background: #eef8f7;
+            border: 1px solid var(--line);
+            font-size: 13px;
+          }}
           .metric {{
             background: #f8fcfc;
             border: 1px solid var(--line);
@@ -185,39 +650,15 @@ def shell(title: str, body: str) -> str:
           }}
           .metric .label {{ color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }}
           .metric .value {{ margin-top: 6px; font-size: 16px; font-weight: 600; }}
-          label {{
-            display: block;
-            margin-bottom: 6px;
-            font-weight: 700;
-            color: var(--ink);
-          }}
-          input, select {{
-            width: 100%;
-            padding: 12px;
-            border-radius: 12px;
-            border: 1px solid var(--line);
-            background: white;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
-            font-size: 15px;
-          }}
-          input[type="checkbox"] {{
-            width: 18px;
-            height: 18px;
-            accent-color: #000000;
-          }}
           textarea {{
             width: 100%;
+            min-height: 300px;
             border: 1px solid var(--line);
             border-radius: 18px;
-            padding: 14px;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
-            font-size: 15px;
-            background: #fbfdfd;
-          }}
-          .note-textarea {{
-            min-height: 300px;
+            padding: 16px;
             font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
             font-size: 14px;
+            background: #fbfdfd;
           }}
           .readonly {{
             border: 1px solid var(--line);
@@ -233,24 +674,21 @@ def shell(title: str, body: str) -> str:
             color: white;
             padding: 12px 16px;
             border-radius: 14px;
-            font-weight: 700;
+            font-weight: 600;
             cursor: pointer;
             box-shadow: 0 8px 18px rgba(29,143,138,0.18);
           }}
-          .btn-soft {{
-            background: #eef8f7;
-            color: var(--ink);
+          .detail-list {{ margin: 0; padding-left: 18px; }}
+          .login-card {{ max-width: 520px; margin: 80px auto 0 auto; }}
+          input {{
+            width: 100%;
+            padding: 12px;
+            border-radius: 12px;
             border: 1px solid var(--line);
-            box-shadow: none;
+            margin-top: 6px;
+            background: rgba(255,255,255,0.97);
           }}
-          .pill {{
-            display: inline-block;
-            padding: 8px 12px;
-            border-radius: 999px;
-            background: #eef8f7;
-            border: 1px solid var(--line);
-            font-size: 13px;
-          }}
+          label {{ display: block; margin-top: 12px; font-weight: 700; }}
           @media (max-width: 980px) {{
             .layout {{ grid-template-columns: 1fr; }}
           }}
@@ -260,506 +698,205 @@ def shell(title: str, body: str) -> str:
         <div class="wrap">
           {body}
         </div>
+        <script>
+          (function() {{
+            const note = document.getElementById("note_text_editor");
+            const summary = document.getElementById("spoken_summary_comments_editor");
+            const packetInput = document.getElementById("current_packet_id");
+            const packetId = packetInput ? packetInput.value : "";
+            if (!packetId) return;
+
+            const noteKey = "callcare_note_draft_" + packetId;
+            const summaryKey = "callcare_summary_draft_" + packetId;
+
+            if (note) {{
+              const savedNote = localStorage.getItem(noteKey);
+              if (savedNote !== null) note.value = savedNote;
+              note.addEventListener("input", function() {{
+                localStorage.setItem(noteKey, note.value);
+              }});
+              const noteForm = note.closest("form");
+              if (noteForm) {{
+                noteForm.addEventListener("submit", function() {{
+                  localStorage.removeItem(noteKey);
+                }});
+              }}
+            }}
+
+            if (summary) {{
+              const savedSummary = localStorage.getItem(summaryKey);
+              if (savedSummary !== null) summary.value = savedSummary;
+              summary.addEventListener("input", function() {{
+                localStorage.setItem(summaryKey, summary.value);
+              }});
+              const summaryForm = summary.closest("form");
+              if (summaryForm) {{
+                summaryForm.addEventListener("submit", function() {{
+                  localStorage.removeItem(summaryKey);
+                }});
+              }}
+            }}
+          }})();
+        </script>
       </body>
     </html>
     """
+    return template.format(title=html_escape(title), body=body)
 
 
-def selected_attr(value: str, selected: Any) -> str:
-    return "selected" if safe_str(value).lower() == safe_str(selected).lower() else ""
+@app.get("/healthz")
+async def healthz() -> PlainTextResponse:
+    return PlainTextResponse("ok")
 
 
-def checkbox_attr(value: Any) -> str:
-    return "checked" if bool(value) else ""
-
-
-def audit_event(cur, patient_id: str, event_type: str, event_json: Dict[str, Any]) -> None:
-    cur.execute(
+@app.get("/login", response_class=HTMLResponse)
+async def login_page() -> str:
+    return shell(
+        "CallCare Physician Login",
         """
-        INSERT INTO callcare.audit_events (
-          id, actor_type, actor_id, patient_id, encounter_id, event_type, event_json, created_at
-        )
-        VALUES (
-          gen_random_uuid(), 'physician', NULL, %s::uuid, NULL, %s, %s::jsonb, now()
-        )
+        <div class="hero">
+          <h1>CallCare Physician Portal</h1>
+          <p>Secure physician access</p>
+        </div>
+
+        <div class="card login-card">
+          <h2 style="margin-top:0;">Log In</h2>
+          <form method="post" action="/login" autocomplete="off">
+            <label>Username</label>
+            <input name="username" />
+            <label>Password</label>
+            <input name="password" type="password" />
+            <div class="btnbar">
+              <button type="submit">Log In</button>
+            </div>
+          </form>
+        </div>
         """,
-        (patient_id, event_type, json.dumps(event_json)),
     )
 
 
-def patient_id_for_chart(cur, chart_number: str) -> str:
-    cur.execute(
-        """
-        SELECT id::text AS patient_id
-        FROM callcare.patients
-        WHERE chart_number = %s
-          AND archived_at IS NULL
-        LIMIT 1
+@app.post("/login")
+async def login(username: str = Form(...), password: str = Form(...)) -> RedirectResponse:
+    if not CALLCARE_PHYSICIAN_USERNAME or not CALLCARE_PHYSICIAN_PASSWORD:
+        raise HTTPException(status_code=500, detail="Physician credentials are not configured")
+    if username != CALLCARE_PHYSICIAN_USERNAME or password != CALLCARE_PHYSICIAN_PASSWORD:
+        return RedirectResponse(url="/login", status_code=303)
+
+    token = make_session_token()
+    SESSIONS[token] = {"username": username, "created_at": now_iso()}
+    response = RedirectResponse(url="/", status_code=303)
+    response.set_cookie("callcare_physician_session", token, httponly=True, samesite="lax", secure=True, path="/")
+    return response
+
+
+@app.get("/logout")
+async def logout(request: Request) -> RedirectResponse:
+    token = request.cookies.get("callcare_physician_session", "")
+    if token and token in SESSIONS:
+        del SESSIONS[token]
+    response = RedirectResponse(url="/login", status_code=303)
+    response.delete_cookie("callcare_physician_session", path="/")
+    return response
+
+
+@app.get("/", response_class=HTMLResponse)
+async def home(request: Request) -> str:
+    require_session(request)
+    groups = patient_groups()
+
+    if not groups:
+        return shell(
+            "CallCare Physician Portal",
+            """
+            <div class="hero">
+              <h1>CallCare Physician Portal</h1>
+              <p>No routed review packets yet.</p>
+            </div>
+            <p><a href="/logout">Log out</a></p>
+            """,
+        )
+
+    rows = []
+    for g in groups:
+        latest = g["encounters"][0]
+        patient_ctx = latest["patient_ctx"] or {}
+        packet = latest["packet"] or {}
+        meta = latest["meta"] or {}
+        label = extract_encounter_label(
+            safe_str(packet.get("note_text")),
+            safe_str(patient_ctx.get("chief_complaint")),
+        )
+        rows.append(
+            f"<tr>"
+            f"<td><a href='/patient/{html_escape(g['chart_number'])}'>{html_escape(g['patient_name'])}</a></td>"
+            f"<td>{html_escape(g['chart_number'])}</td>"
+            f"<td>{html_escape(label)}</td>"
+            f"<td>{html_escape(encounter_when(safe_str(latest.get('created_at'))))}</td>"
+            f"<td>{html_escape(safe_str(meta.get('status')))}</td>"
+            f"<td>{html_escape(safe_str(meta.get('prescription_status')))}</td>"
+            f"</tr>"
+        )
+
+    return shell(
+        "CallCare Physician Portal",
+        f"""
+        <div class="hero">
+          <h1>CallCare Physician Portal</h1>
+          <p>Physician review workspace</p>
+        </div>
+
+        <p><a href="/logout">Log out</a></p>
+
+        <div class="card list-card">
+          <table>
+            <thead>
+              <tr>
+                <th>Patient</th>
+                <th>Chart #</th>
+                <th>Encounter</th>
+                <th>Date / Time</th>
+                <th>Status</th>
+                <th>Prescription</th>
+              </tr>
+            </thead>
+            <tbody>
+              {''.join(rows)}
+            </tbody>
+          </table>
+        </div>
         """,
-        (chart_number,),
     )
-    row = cur.fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail="Patient not found")
-    return row["patient_id"]
 
 
-def _extract_differential_title(note_text: str, fallback: str) -> str:
-    text = safe_str(note_text)
-    lower_text = text.lower()
-    marker = "the working diagnosis is "
-    likely_marker = " likely"
-    start = lower_text.find(marker)
-    if start != -1:
-        start += len(marker)
-        end = lower_text.find(likely_marker, start)
-        if end != -1:
-            diagnosis = text[start:end].strip(" .:-")
-            if diagnosis:
-                return diagnosis[:1].upper() + diagnosis[1:]
 
-    diff_marker = "Differential:"
-    if diff_marker in text:
-        tail = text.split(diff_marker, 1)[1]
-        for line in tail.splitlines():
-            line = safe_str(line)
-            if line.startswith("1."):
-                line = line[2:].strip()
-                if line:
-                    return "Possible " + line[:1].lower() + line[1:]
-
-    f = safe_str(fallback).strip().rstrip(".")
-    for prefix in ("i have ", "i'm having ", "im having ", "i am having ", "my "):
-        if f.lower().startswith(prefix):
-            f = f[len(prefix):].strip()
-            break
-    return f[:1].upper() + f[1:] if f else "Encounter"
-
-
-def _shared_lookup_patient_id(chart_number: str) -> Optional[str]:
-    if not shared_db_url() or not chart_number:
-        return None
-    with db_connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT id::text AS patient_id FROM callcare.patients WHERE chart_number = %s LIMIT 1",
-                (chart_number,),
-            )
-            row = cur.fetchone()
-            return row["patient_id"] if row else None
-
-
-def _lookup_shared_patient_by_call_sid(call_sid: str) -> Optional[Dict[str, Any]]:
-    if not shared_db_url() or not call_sid:
-        return None
-    with db_connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT p.id::text AS patient_id, p.chart_number, e.chief_complaint
-                FROM callcare.encounters e
-                JOIN callcare.patients p ON p.id = e.patient_id
-                WHERE e.call_sid = %s
-                ORDER BY e.started_at DESC
-                LIMIT 1
-                """,
-                (call_sid,),
-            )
-            row = cur.fetchone()
-            return dict(row) if row else None
-
-
-def _sync_bundle_to_shared_db(bundle: dict) -> None:
-    if not shared_db_url() or not bundle:
-        return
-
-    packet = bundle.get("packet") or {}
-    meta = bundle.get("meta") or {}
-    patient_ctx = bundle.get("patient_ctx") or {}
-
-    packet_id = safe_str(bundle.get("packet_id") or packet.get("packet_id"))
-    if not packet_id:
-        return
-
-    chart_number = safe_str(patient_ctx.get("chart_number"))
-    chief_complaint = safe_str(patient_ctx.get("chief_complaint"))
-    patient_id = safe_str(patient_ctx.get("patient_id"))
-    call_sid = safe_str(bundle.get("call_sid"))
-
-    if not call_sid:
-        try:
-            call_sid = safe_str(load_meta(packet_id).get("call_sid"))
-        except Exception:
-            pass
-
-    if chart_number and not patient_id:
-        patient_id = _shared_lookup_patient_id(chart_number) or ""
-
-    if (not chart_number or not patient_id or not chief_complaint) and call_sid:
-        linked = _lookup_shared_patient_by_call_sid(call_sid)
-        if linked:
-            chart_number = chart_number or safe_str(linked.get("chart_number"))
-            patient_id = patient_id or safe_str(linked.get("patient_id"))
-            chief_complaint = chief_complaint or safe_str(linked.get("chief_complaint"))
-
-    if not chart_number or not patient_id:
-        return
-
-    with db_connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO callcare.portal_packets (
-                    packet_id, chart_number, patient_id, call_sid, session_id, pathway_id,
-                    created_at, chief_complaint, note_text, spoken_summary,
-                    spoken_summary_comments, status, prescription_status, note_sent,
-                    signed, signed_at, signed_by, addenda, updated_at
-                )
-                VALUES (
-                    %s, %s, %s::uuid, NULLIF(%s, ''), NULLIF(%s, ''), NULLIF(%s, ''),
-                    NULLIF(%s, '')::timestamptz, NULLIF(%s, ''), NULLIF(%s, ''),
-                    COALESCE(NULLIF(%s, ''), ''), COALESCE(NULLIF(%s, ''), ''),
-                    COALESCE(NULLIF(%s, ''), 'active'),
-                    COALESCE(NULLIF(%s, ''), 'under review'),
-                    COALESCE(NULLIF(%s, ''), 'to be mailed'),
-                    %s, NULLIF(%s, '')::timestamptz, COALESCE(NULLIF(%s, ''), ''),
-                    %s::jsonb, now()
-                )
-                ON CONFLICT (packet_id) DO UPDATE
-                SET chart_number = EXCLUDED.chart_number,
-                    patient_id = EXCLUDED.patient_id,
-                    call_sid = EXCLUDED.call_sid,
-                    session_id = EXCLUDED.session_id,
-                    pathway_id = EXCLUDED.pathway_id,
-                    created_at = EXCLUDED.created_at,
-                    chief_complaint = EXCLUDED.chief_complaint,
-                    note_text = EXCLUDED.note_text,
-                    spoken_summary = EXCLUDED.spoken_summary,
-                    spoken_summary_comments = EXCLUDED.spoken_summary_comments,
-                    status = EXCLUDED.status,
-                    prescription_status = EXCLUDED.prescription_status,
-                    note_sent = EXCLUDED.note_sent,
-                    signed = EXCLUDED.signed,
-                    signed_at = EXCLUDED.signed_at,
-                    signed_by = EXCLUDED.signed_by,
-                    addenda = EXCLUDED.addenda,
-                    updated_at = now()
-                """,
-                (
-                    packet_id,
-                    chart_number,
-                    patient_id,
-                    call_sid,
-                    safe_str(packet.get("session_id")),
-                    safe_str(packet.get("pathway_id")),
-                    safe_str(packet.get("created_at")),
-                    chief_complaint,
-                    safe_str(packet.get("note_text")),
-                    safe_str(bundle.get("spoken_summary")),
-                    safe_str(meta.get("spoken_summary_comments")),
-                    safe_str(meta.get("status")),
-                    safe_str(meta.get("prescription_status")),
-                    safe_str(meta.get("note_sent")),
-                    bool(meta.get("signed")),
-                    safe_str(meta.get("signed_at")),
-                    safe_str(meta.get("signed_by")),
-                    json.dumps(meta.get("addenda") or []),
-                ),
-            )
-        conn.commit()
-
-
-def _queue_or_send_new_note_email_resend(packet_id: str, patient_ctx: dict, reason: str = "note_ready") -> Dict[str, Any]:
-    outbox_dir = Path("logs") / "email_outbox"
-    outbox_dir.mkdir(parents=True, exist_ok=True)
-
-    to_email = safe_str(patient_ctx.get("email"))
-    patient_name = safe_str(patient_ctx.get("patient_name")) or "Patient"
-    chart_number = safe_str(patient_ctx.get("chart_number"))
-    portal_url = f"{CALLCARE_PUBLIC_BASE_URL}/portal/login"
-
-    if reason == "addendum":
-        subject = "A CallCare note was updated"
-        plain = f"Hello {patient_name},\n\nA physician updated a note in your CallCare patient portal.\n\nPlease log in:\n{portal_url}\n"
-    else:
-        subject = "A new CallCare note is available"
-        plain = f"Hello {patient_name},\n\nA new CallCare note is available in your CallCare patient portal.\n\nPlease log in:\n{portal_url}\n"
-
-    payload = {
-        "queued_at": now_iso(),
-        "to_email": to_email,
-        "patient_name": patient_name,
-        "chart_number": chart_number,
-        "packet_id": packet_id,
-        "subject": subject,
-        "body": plain,
-        "reason": reason,
-        "sent": False,
-        "send_method": "queued_only",
+def allergy_severity_options(selected: str) -> str:
+    selected = safe_str(selected).lower()
+    options = ["", "mild", "moderate", "severe", "life-threatening"]
+    labels = {
+        "": "Select",
+        "mild": "Mild",
+        "moderate": "Moderate",
+        "severe": "Severe",
+        "life-threatening": "Life-threatening",
     }
-
-    if not to_email:
-        payload["error"] = "No patient email on file"
-    elif CALLCARE_EMAIL_PROVIDER == "resend" and CALLCARE_RESEND_API_KEY:
-        try:
-            resp = requests.post(
-                "https://api.resend.com/emails",
-                headers={
-                    "Authorization": f"Bearer {CALLCARE_RESEND_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "from": "CallCare <onboarding@resend.dev>",
-                    "to": [to_email],
-                    "subject": subject,
-                    "text": plain,
-                },
-                timeout=20,
-            )
-            if 200 <= resp.status_code < 300:
-                payload["sent"] = True
-                payload["send_method"] = "resend"
-            else:
-                payload["error"] = safe_str(resp.text)
-        except Exception as e:
-            payload["error"] = safe_str(e)
-    else:
-        result = queue_or_send_new_note_email(patient_ctx, chart_number, packet_id)
-        payload.update(result)
-
-    outbox_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{packet_id}.json"
-    (outbox_dir / outbox_name).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    return payload
+    return "".join(
+        f"<option value='{html_escape(v)}' {'selected' if selected == v else ''}>{html_escape(labels[v])}</option>"
+        for v in options
+    )
 
 
-def fetch_chart_profile(chart_number: str) -> Dict[str, Any]:
-    if not shared_db_url():
-        return {}
+def physician_history_allergies_form(chart_number: str, packet_id: str) -> str:
+    bundle = portal_common.patient_history_allergies_bundle(chart_number)
+    conditions = bundle.get("conditions") or []
+    allergies = bundle.get("allergies") or []
 
-    with db_connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                  p.id::text AS patient_id,
-                  p.chart_number,
-                  trim(concat_ws(' ', p.legal_first_name, p.legal_last_name)) AS patient_name,
-                  p.legal_first_name,
-                  p.legal_last_name,
-                  p.preferred_name,
-                  p.date_of_birth::text AS date_of_birth,
-                  p.sex_at_birth,
-                  p.gender_identity,
-                  p.phone_number,
-                  p.email
-                FROM callcare.patients p
-                WHERE p.chart_number = %s
-                  AND p.archived_at IS NULL
-                LIMIT 1
-                """,
-                (chart_number,),
-            )
-            patient = dict(cur.fetchone() or {})
-            patient_id = patient.get("patient_id")
-            if not patient_id:
-                return {}
+    existing = {}
+    for item in conditions:
+        existing[safe_str(item.get("condition_name")).lower()] = item
 
-            cur.execute(
-                """
-                SELECT address_line_1, address_line_2, city, state, postal_code, county_name
-                FROM callcare.patient_addresses
-                WHERE patient_id = %s::uuid
-                ORDER BY created_at DESC NULLS LAST
-                LIMIT 1
-                """,
-                (patient_id,),
-            )
-            address = dict(cur.fetchone() or {})
-
-            cur.execute(
-                """
-                SELECT height_feet, height_inches, weight_lbs
-                FROM callcare.patient_vitals
-                WHERE patient_id = %s::uuid
-                ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
-                LIMIT 1
-                """,
-                (patient_id,),
-            )
-            vitals = dict(cur.fetchone() or {})
-
-            cur.execute(
-                """
-                SELECT ph.name, ph.address_line_1, ph.city, ph.state, ph.postal_code, ph.phone, ph.fax
-                FROM callcare.patient_pharmacies pp
-                JOIN callcare.pharmacies ph ON ph.id = pp.pharmacy_id
-                WHERE pp.patient_id = %s::uuid
-                  AND pp.is_preferred = true
-                ORDER BY pp.created_at DESC
-                LIMIT 1
-                """,
-                (patient_id,),
-            )
-            pharmacy = dict(cur.fetchone() or {})
-
-            return {
-                "patient": patient,
-                "address": address,
-                "vitals": vitals,
-                "pharmacy": pharmacy,
-            }
-
-
-def fetch_history_allergies(chart_number: str) -> Dict[str, Any]:
-    with db_connect() as conn:
-        with conn.cursor() as cur:
-            patient_id = patient_id_for_chart(cur, chart_number)
-
-            cur.execute(
-                """
-                SELECT
-                  condition_name,
-                  bool_or(current_flag) AS current_flag,
-                  bool_or(past_flag) AS past_flag,
-                  bool_or(family_history_flag) AS family_history_flag,
-                  string_agg(DISTINCT COALESCE(notes, ''), '; ') AS notes
-                FROM callcare.patient_conditions
-                WHERE patient_id = %s::uuid
-                  AND archived_at IS NULL
-                GROUP BY condition_name
-                ORDER BY condition_name
-                """,
-                (patient_id,),
-            )
-            conditions = [dict(r) for r in cur.fetchall()]
-
-            cur.execute(
-                """
-                SELECT allergen, reaction, severity, is_active
-                FROM callcare.patient_allergies
-                WHERE patient_id = %s::uuid
-                ORDER BY is_active DESC, updated_at DESC, created_at DESC
-                """,
-                (patient_id,),
-            )
-            allergies = [dict(r) for r in cur.fetchall()]
-
-            return {"patient_id": patient_id, "conditions": conditions, "allergies": allergies}
-
-
-def fetch_medications(chart_number: str) -> List[Dict[str, Any]]:
-    with db_connect() as conn:
-        with conn.cursor() as cur:
-            patient_id = patient_id_for_chart(cur, chart_number)
-            cur.execute(
-                """
-                SELECT medication_name, strength, dose_instructions, route, frequency, is_current
-                FROM callcare.patient_medications
-                WHERE patient_id = %s::uuid
-                ORDER BY is_current DESC, updated_at DESC, created_at DESC
-                """,
-                (patient_id,),
-            )
-            return [dict(r) for r in cur.fetchall()]
-
-
-def fetch_social(chart_number: str) -> Dict[str, Any]:
-    with db_connect() as conn:
-        with conn.cursor() as cur:
-            patient_id = patient_id_for_chart(cur, chart_number)
-            cur.execute(
-                """
-                SELECT tobacco_status, alcohol_use, drug_use, exercise_level, occupation,
-                       sexually_active, sexual_partners_count, uses_protection, protection_type,
-                       previous_tobacco_user, tobacco_products, cigarette_packs_per_day,
-                       recreational_drug_use
-                FROM callcare.patient_social_history_structured
-                WHERE patient_id = %s::uuid
-                ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
-                LIMIT 1
-                """,
-                (patient_id,),
-            )
-            return dict(cur.fetchone() or {})
-
-
-def demographics_form(chart_number: str, packet_id: str) -> str:
-    bundle = fetch_chart_profile(chart_number)
-    patient = bundle.get("patient") or {}
-    address = bundle.get("address") or {}
-    vitals = bundle.get("vitals") or {}
-    pharmacy = bundle.get("pharmacy") or {}
-
-    return f"""
-    <form method="post" action="/patient/{html_escape(chart_number)}/demographics?packet_id={html_escape(packet_id)}" autocomplete="off">
-      <div class="card">
-        <h2 class="section-title">Background</h2>
-        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:18px;">
-          <div><label>Preferred Name</label><input name="preferred_name" value="{html_escape(patient.get('preferred_name'))}" /></div>
-          <div><label>Phone Number</label><input name="phone_number" value="{html_escape(patient.get('phone_number'))}" /></div>
-          <div><label>Email</label><input name="email" value="{html_escape(patient.get('email'))}" /></div>
-          <div>
-            <label>Sex Assigned at Birth</label>
-            <select name="sex_at_birth">
-              <option value="">Select</option>
-              <option value="female" {selected_attr("female", patient.get("sex_at_birth"))}>Female</option>
-              <option value="male" {selected_attr("male", patient.get("sex_at_birth"))}>Male</option>
-              <option value="intersex" {selected_attr("intersex", patient.get("sex_at_birth"))}>Intersex</option>
-              <option value="prefer not to say" {selected_attr("prefer not to say", patient.get("sex_at_birth"))}>Prefer not to say</option>
-            </select>
-          </div>
-          <div><label>Gender Identity</label><input name="gender_identity" value="{html_escape(patient.get('gender_identity'))}" /></div>
-        </div>
-      </div>
-
-      <div class="card" style="margin-top:20px;">
-        <h2 class="section-title">Address</h2>
-        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:18px;">
-          <div><label>Address</label><input name="address_line_1" value="{html_escape(address.get('address_line_1'))}" /></div>
-          <div><label>Apartment / Unit</label><input name="address_line_2" value="{html_escape(address.get('address_line_2'))}" /></div>
-          <div><label>City</label><input name="city" value="{html_escape(address.get('city'))}" /></div>
-          <div><label>State</label><input name="state" value="{html_escape(address.get('state') or 'GA')}" /></div>
-          <div><label>ZIP Code</label><input name="postal_code" value="{html_escape(address.get('postal_code'))}" /></div>
-          <div><label>County</label><input name="county_name" value="{html_escape(address.get('county_name'))}" /></div>
-        </div>
-      </div>
-
-      <div class="card" style="margin-top:20px;">
-        <h2 class="section-title">Height & Weight</h2>
-        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:18px;">
-          <div><label>Height Feet</label><input name="height_feet" value="{html_escape(vitals.get('height_feet'))}" /></div>
-          <div><label>Height Inches</label><input name="height_inches" value="{html_escape(vitals.get('height_inches'))}" /></div>
-          <div><label>Weight Pounds</label><input name="weight_lbs" value="{html_escape(vitals.get('weight_lbs'))}" /></div>
-        </div>
-      </div>
-
-      <div class="card" style="margin-top:20px;">
-        <h2 class="section-title">Preferred Pharmacy</h2>
-        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:18px;">
-          <div><label>Pharmacy Name</label><input name="pharmacy_name" value="{html_escape(pharmacy.get('name'))}" /></div>
-          <div><label>Pharmacy Address</label><input name="pharmacy_address_line_1" value="{html_escape(pharmacy.get('address_line_1'))}" /></div>
-          <div><label>Pharmacy City</label><input name="pharmacy_city" value="{html_escape(pharmacy.get('city'))}" /></div>
-          <div><label>Pharmacy State</label><input name="pharmacy_state" value="{html_escape(pharmacy.get('state') or 'GA')}" /></div>
-          <div><label>Pharmacy ZIP Code</label><input name="pharmacy_postal_code" value="{html_escape(pharmacy.get('postal_code'))}" /></div>
-          <div><label>Pharmacy Phone</label><input name="pharmacy_phone" value="{html_escape(pharmacy.get('phone'))}" /></div>
-          <div><label>Pharmacy Fax</label><input name="pharmacy_fax" value="{html_escape(pharmacy.get('fax'))}" /></div>
-        </div>
-        <p class="btnbar"><button type="submit">Save Demographics & Pharmacy</button></p>
-      </div>
-    </form>
-    """
-
-
-def history_form(chart_number: str, packet_id: str) -> str:
-    data = fetch_history_allergies(chart_number)
-    conditions = data.get("conditions") or []
-    allergies = data.get("allergies") or []
-
-    existing = {safe_str(c.get("condition_name")).lower(): c for c in conditions}
-    common_names = {c.lower() for c in COMMON_HISTORY_CONDITIONS}
-    other_lines = []
+    common_names = {safe_str(c).lower() for c in COMMON_HISTORY_CONDITIONS}
     seen_other = set()
-
+    other_lines = []
     for item in conditions:
         name = safe_str(item.get("condition_name"))
         key = name.lower()
@@ -768,17 +905,21 @@ def history_form(chart_number: str, packet_id: str) -> str:
         seen_other.add(key)
         other_lines.append(name)
 
+    other_existing = "\n".join(other_lines)
+
     rows = []
     for cond in COMMON_HISTORY_CONDITIONS:
-        item = existing.get(cond.lower()) or {}
-        key = cond.lower().replace(" ", "_")
+        key = cond.lower()
+        item = existing.get(key) or {}
+        form_key = cond.lower().replace(" ", "_")
+
         rows.append(
             f"""
-            <tr style="background:{'rgba(47,158,143,0.10)' if len(rows) % 2 == 0 else 'rgba(255,255,255,0.95)'};">
+            <tr style="background:{'rgba(47,158,143,0.10)' if len(rows) % 2 == 0 else 'rgba(255,255,255,0.96)'};">
               <td>{html_escape(cond)}</td>
-              <td style="text-align:center;"><input type="checkbox" name="{html_escape(key)}_current" {checkbox_attr(item.get("current_flag"))}></td>
-              <td style="text-align:center;"><input type="checkbox" name="{html_escape(key)}_past" {checkbox_attr(item.get("past_flag"))}></td>
-              <td style="text-align:center;"><input type="checkbox" name="{html_escape(key)}_family" {checkbox_attr(item.get("family_history_flag"))}></td>
+              <td style="text-align:center;"><input type="checkbox" name="{html_escape(form_key)}_current" {"checked" if item.get("current_flag") else ""}></td>
+              <td style="text-align:center;"><input type="checkbox" name="{html_escape(form_key)}_past" {"checked" if item.get("past_flag") else ""}></td>
+              <td style="text-align:center;"><input type="checkbox" name="{html_escape(form_key)}_family" {"checked" if item.get("family_history_flag") else ""}></td>
             </tr>
             """
         )
@@ -787,36 +928,34 @@ def history_form(chart_number: str, packet_id: str) -> str:
     total_allergy_rows = max(1, len(allergies))
 
     for i in range(total_allergy_rows):
-        a = allergies[i] if i < len(allergies) else {}
-        severity = safe_str(a.get("severity")).lower()
+        item = allergies[i] if i < len(allergies) else {}
+        allergen = safe_str(item.get("allergen"))
+        reaction = safe_str(item.get("reaction"))
+        severity = safe_str(item.get("severity"))
+        active_checked = "checked" if allergen and item.get("is_active") is True else ""
+
         allergy_rows.append(
             f"""
             <tr style="background:{'rgba(47,158,143,0.10)' if i % 2 == 0 else 'rgba(255,255,255,0.96)'};">
-              <td><input name="allergy_{i}_allergen" value="{html_escape(a.get('allergen'))}" placeholder="Allergen" oninput="autoCheckAllergyRow(this)" /></td>
-              <td><input name="allergy_{i}_reaction" value="{html_escape(a.get('reaction'))}" placeholder="Reaction" /></td>
-              <td>
-                <select name="allergy_{i}_severity">
-                  <option value="">Select</option>
-                  <option value="mild" {selected_attr("mild", severity)}>Mild</option>
-                  <option value="moderate" {selected_attr("moderate", severity)}>Moderate</option>
-                  <option value="severe" {selected_attr("severe", severity)}>Severe</option>
-                  <option value="life-threatening" {selected_attr("life-threatening", severity)}>Life-threatening</option>
-                </select>
-              </td>
-              <td style="text-align:center;"><input type="checkbox" name="allergy_{i}_active" {checkbox_attr(a.get("is_active") if a.get("allergen") else False)}></td>
+              <td><input name="allergy_{i}_allergen" value="{html_escape(allergen)}" placeholder="Allergen" oninput="autoCheckAllergyRow(this)" /></td>
+              <td><input name="allergy_{i}_reaction" value="{html_escape(reaction)}" placeholder="Reaction" /></td>
+              <td><select name="allergy_{i}_severity" style="width:100%;padding:12px;border-radius:12px;border:1px solid #ccc;background:white;font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;font-size:15px;">{allergy_severity_options(severity)}</select></td>
+              <td style="text-align:center;"><input type="checkbox" name="allergy_{i}_active" {active_checked} /></td>
             </tr>
             """
         )
 
     return f"""
-    <form method="post" action="/patient/{html_escape(chart_number)}/history?packet_id={html_escape(packet_id)}">
+    <form method="post" action="/patient/{html_escape(chart_number)}/history-allergies?packet_id={html_escape(packet_id)}">
       <div class="card">
         <h2 class="section-title">Medical History</h2>
+
         <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:18px;align-items:start;">
           <table>
             <thead><tr><th>Condition</th><th>Current</th><th>Past</th><th>Family History</th></tr></thead>
             <tbody>{''.join(rows[:(len(rows)+1)//2])}</tbody>
           </table>
+
           <table>
             <thead><tr><th>Condition</th><th>Current</th><th>Past</th><th>Family History</th></tr></thead>
             <tbody>{''.join(rows[(len(rows)+1)//2:])}</tbody>
@@ -824,21 +963,26 @@ def history_form(chart_number: str, packet_id: str) -> str:
         </div>
       </div>
 
-      <div class="card" style="margin-top:20px;">
+      <div class="card">
+        <h2 class="section-title">Other Conditions</h2>
+        <textarea name="other_conditions" rows="8" style="width:100%;border-radius:12px;padding:12px;resize:vertical;height:150px;min-height:150px;max-height:150px;resize:vertical;">{html_escape(other_existing)}</textarea>
+      </div>
+
+      <div class="card">
         <h2 class="section-title">Allergies</h2>
-        <table>
+
+        <table id="allergies-table">
           <thead><tr><th>Allergen</th><th>Reaction</th><th>Severity</th><th>Active</th></tr></thead>
           <tbody id="allergies-body">{''.join(allergy_rows)}</tbody>
         </table>
-        <div style="margin-top:18px;display:flex;justify-content:flex-end;">
-          <button type="button" onclick="addAllergyRow()">Add Another Row</button>
-        </div>
-      </div>
 
-      <div class="card" style="margin-top:20px;">
-        <h2 class="section-title">Other Conditions</h2>
-        <textarea name="other_conditions" rows="8" style="height:150px;min-height:150px;max-height:150px;resize:vertical;" placeholder="Enter any additional diagnoses or medical conditions here.">{html_escape(chr(10).join(other_lines))}</textarea>
-        <p class="btnbar"><button type="submit">Save Medical History</button></p>
+        <div style="margin-top:18px;display:flex;justify-content:flex-end;">
+          <button type="button" onclick="addAllergyRow()" style="font-size:15px;padding:10px 16px;border-radius:18px;font-weight:800;">Add Another Row</button>
+        </div>
+
+        <div style="margin-top:22px;">
+          <button type="submit" style="font-size:16px;padding:12px 18px;border-radius:18px;font-weight:800;">Save Medical History & Allergies</button>
+        </div>
       </div>
 
       <script>
@@ -849,12 +993,12 @@ def history_form(chart_number: str, packet_id: str) -> str:
           if (!row) return;
           const checkbox = row.querySelector("input[type='checkbox']");
           if (!checkbox) return;
-          checkbox.checked = input.value.trim().length > 0;
+          if (input.value.trim().length > 0) checkbox.checked = true;
+          if (input.value.trim().length === 0) checkbox.checked = false;
         }}
 
         function addAllergyRow() {{
           const body = document.getElementById("allergies-body");
-          if (!body) return;
           const i = nextAllergyIndex++;
           const tr = document.createElement("tr");
           tr.style.background = i % 2 === 0 ? "rgba(47,158,143,0.10)" : "rgba(255,255,255,0.96)";
@@ -862,7 +1006,7 @@ def history_form(chart_number: str, packet_id: str) -> str:
             <td><input name="allergy_${{i}}_allergen" placeholder="Allergen" oninput="autoCheckAllergyRow(this)" /></td>
             <td><input name="allergy_${{i}}_reaction" placeholder="Reaction" /></td>
             <td>
-              <select name="allergy_${{i}}_severity">
+              <select name="allergy_${i}_severity" style="width:100%;padding:12px;border-radius:12px;border:1px solid #ccc;background:white;font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;font-size:15px;">
                 <option value="">Select</option>
                 <option value="mild">Mild</option>
                 <option value="moderate">Moderate</option>
@@ -879,614 +1023,548 @@ def history_form(chart_number: str, packet_id: str) -> str:
     """
 
 
-def medications_form(chart_number: str, packet_id: str) -> str:
-    meds = fetch_medications(chart_number)
+@app.post("/patient/{chart_number}/history-allergies")
+async def save_physician_history_allergies(
+    chart_number: str,
+    request: Request,
+    packet_id: str = Query(default=""),
+) -> RedirectResponse:
+    require_session(request)
+    form = await request.form()
+    portal_common.save_patient_history_allergies(chart_number, dict(form), actor_type="physician")
+    return RedirectResponse(
+        url=f"/patient/{chart_number}?packet_id={packet_id}&tab=pmh",
+        status_code=303,
+    )
 
-    deduped = []
-    seen = set()
-    for med in meds:
-        key = (
-            safe_str(med.get("medication_name")).lower(),
-            safe_str(med.get("strength") or med.get("dose_instructions")).lower(),
-            safe_str(med.get("route")).lower(),
-            safe_str(med.get("frequency")).lower(),
-        )
-        if key in seen:
+
+
+COMMON_HISTORY_CONDITIONS_PHYSICIAN = ['Hypertension', 'Diabetes', 'High Cholesterol', 'Coronary Artery Disease', 'Heart Failure', 'Atrial Fibrillation', 'Stroke', 'COPD', 'Asthma', 'Sleep Apnea', 'GERD', 'Peptic Ulcer Disease', 'Irritable Bowel Syndrome', 'Crohn Disease', 'Ulcerative Colitis', 'Chronic Kidney Disease', 'Kidney Stones', 'Migraines', 'Seizure Disorder', 'Depression', 'Anxiety', 'Bipolar Disorder', 'PTSD', 'ADHD', 'Hypothyroidism', 'Hyperthyroidism', 'Obesity', 'Osteoarthritis', 'Rheumatoid Arthritis', 'Fibromyalgia', 'Osteoporosis', 'Chronic Back Pain', 'Anemia', 'Cancer', 'Breast Cancer', 'Colon Cancer', 'Prostate Cancer', 'Skin Cancer', 'Liver Disease', 'Hepatitis', 'HIV', 'Peripheral Neuropathy', 'Dementia', 'Parkinson Disease', 'Glaucoma', 'Macular Degeneration', 'Seasonal Allergies', 'Eczema', 'Psoriasis', 'Gout']
+
+
+def physician_history_rows_from_db(chart_number: str):
+    if not CALLCARE_SHARED_DATABASE_URL:
+        return []
+
+    with psycopg.connect(CALLCARE_SHARED_DATABASE_URL, row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                  c.condition_name,
+                  bool_or(c.current_flag) AS current_flag,
+                  bool_or(c.past_flag) AS past_flag,
+                  bool_or(c.family_history_flag) AS family_history_flag,
+                  string_agg(DISTINCT COALESCE(c.notes, ''), '; ') AS notes
+                FROM callcare.patients p
+                JOIN callcare.patient_conditions c
+                  ON c.patient_id = p.id
+                WHERE p.chart_number = %s
+                  AND p.archived_at IS NULL
+                  AND c.archived_at IS NULL
+                GROUP BY c.condition_name
+                ORDER BY c.condition_name
+                """,
+                (chart_number,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+
+def physician_allergy_rows_from_db(chart_number: str):
+    if not CALLCARE_SHARED_DATABASE_URL:
+        return []
+
+    with psycopg.connect(CALLCARE_SHARED_DATABASE_URL, row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                  a.allergen,
+                  a.reaction,
+                  a.severity,
+                  a.is_active
+                FROM callcare.patients p
+                JOIN callcare.patient_allergies a
+                  ON a.patient_id = p.id
+                WHERE p.chart_number = %s
+                  AND p.archived_at IS NULL
+                ORDER BY a.is_active DESC, a.updated_at DESC, a.created_at DESC
+                """,
+                (chart_number,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+
+
+def physician_demographics_bundle(chart_number: str) -> dict:
+    if not CALLCARE_SHARED_DATABASE_URL:
+        return {}
+
+    with psycopg.connect(CALLCARE_SHARED_DATABASE_URL, row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+
+            cur.execute(
+                """
+                SELECT
+                  p.id::text AS patient_id,
+                  p.legal_first_name,
+                  p.legal_last_name,
+                  p.preferred_name,
+                  p.date_of_birth::text AS date_of_birth,
+                  p.sex_at_birth,
+                  p.gender_identity,
+                  p.phone_number,
+                  p.email
+                FROM callcare.patients p
+                WHERE p.chart_number = %s
+                  AND p.archived_at IS NULL
+                LIMIT 1
+                """,
+                (chart_number,),
+            )
+
+            patient = dict(cur.fetchone() or {})
+
+            patient_id = patient.get("patient_id")
+            if not patient_id:
+                return {}
+
+            cur.execute(
+                """
+                SELECT
+                  address_line_1,
+                  address_line_2,
+                  city,
+                  state,
+                  postal_code,
+                  county_name
+                FROM callcare.patient_addresses
+                WHERE patient_id = %s::uuid
+                ORDER BY updated_at DESC NULLS LAST
+                LIMIT 1
+                """,
+                (patient_id,),
+            )
+
+            address = dict(cur.fetchone() or {})
+
+            cur.execute(
+                """
+                SELECT
+                  ph.name,
+                  ph.address_line_1,
+                  ph.city,
+                  ph.state,
+                  ph.postal_code,
+                  ph.phone,
+                  ph.fax
+                FROM callcare.patient_pharmacies pp
+                JOIN callcare.pharmacies ph
+                  ON ph.id = pp.pharmacy_id
+                WHERE pp.patient_id = %s::uuid
+                  AND pp.is_preferred = true
+                LIMIT 1
+                """,
+                (patient_id,),
+            )
+
+            pharmacy = dict(cur.fetchone() or {})
+
+            cur.execute(
+                """
+                SELECT
+                  height_feet,
+                  height_inches,
+                  weight_lbs
+                FROM callcare.patient_vitals
+                WHERE patient_id = %s::uuid
+                ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+                LIMIT 1
+                """,
+                (patient_id,),
+            )
+
+            vitals = dict(cur.fetchone() or {})
+
+    return {
+        "patient": patient,
+        "address": address,
+        "pharmacy": pharmacy,
+        "vitals": vitals,
+    }
+
+
+def physician_demographics_form_html(
+    chart_number: str,
+    selected_packet_id: str,
+) -> str:
+
+    bundle = physician_demographics_bundle(chart_number)
+
+    patient = bundle.get("patient") or {}
+    address = bundle.get("address") or {}
+    pharmacy = bundle.get("pharmacy") or {}
+    vitals = bundle.get("vitals") or {}
+
+    return f"""
+    <form method="post"
+          action="/patient/{html_escape(chart_number)}/demographics?packet_id={html_escape(selected_packet_id)}"
+          autocomplete="off">
+
+      <div class="card">
+        <h2 class="section-title">Background</h2>
+
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:18px;">
+
+          <div>
+            <label>Preferred Name</label>
+            <input name="preferred_name"
+                   value="{html_escape(patient.get('preferred_name'))}" />
+          </div>
+
+          <div>
+            <label>Phone Number</label>
+            <input name="phone_number"
+                   value="{html_escape(patient.get('phone_number'))}" />
+          </div>
+
+          <div>
+            <label>Email</label>
+            <input name="email"
+                   value="{html_escape(patient.get('email'))}" />
+          </div>
+
+          <div>
+            <label>Sex Assigned at Birth</label>
+            <select name="sex_at_birth"
+                    style="width:100%;padding:12px;border-radius:12px;border:1px solid #ccc;background:white;">
+              <option value="">Select</option>
+              <option value="female" {"selected" if safe_str(patient.get('sex_at_birth')).lower() == "female" else ""}>Female</option>
+              <option value="male" {"selected" if safe_str(patient.get('sex_at_birth')).lower() == "male" else ""}>Male</option>
+              <option value="intersex" {"selected" if safe_str(patient.get('sex_at_birth')).lower() == "intersex" else ""}>Intersex</option>
+            </select>
+          </div>
+
+          <div>
+            <label>Gender Identity</label>
+            <input name="gender_identity"
+                   value="{html_escape(patient.get('gender_identity'))}" />
+          </div>
+
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:20px;">
+        <h2 class="section-title">Address</h2>
+
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:18px;">
+
+          <div>
+            <label>Address</label>
+            <input name="address_line_1"
+                   value="{html_escape(address.get('address_line_1'))}" />
+          </div>
+
+          <div>
+            <label>Apartment / Unit</label>
+            <input name="address_line_2"
+                   value="{html_escape(address.get('address_line_2'))}" />
+          </div>
+
+          <div>
+            <label>City</label>
+            <input name="city"
+                   value="{html_escape(address.get('city'))}" />
+          </div>
+
+          <div>
+            <label>State</label>
+            <input name="state"
+                   value="{html_escape(address.get('state'))}" />
+          </div>
+
+          <div>
+            <label>ZIP Code</label>
+            <input name="postal_code"
+                   value="{html_escape(address.get('postal_code'))}" />
+          </div>
+
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:20px;">
+        <h2 class="section-title">Height & Weight</h2>
+
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:18px;">
+
+          <div>
+            <label>Height Feet</label>
+            <input name="height_feet"
+                   value="{html_escape(vitals.get('height_feet'))}" />
+          </div>
+
+          <div>
+            <label>Height Inches</label>
+            <input name="height_inches"
+                   value="{html_escape(vitals.get('height_inches'))}" />
+          </div>
+
+          <div>
+            <label>Weight Pounds</label>
+            <input name="weight_lbs"
+                   value="{html_escape(vitals.get('weight_lbs'))}" />
+          </div>
+
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:20px;">
+        <h2 class="section-title">Preferred Pharmacy</h2>
+
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:18px;">
+
+          <div>
+            <label>Pharmacy Name</label>
+            <input name="pharmacy_name"
+                   value="{html_escape(pharmacy.get('name'))}" />
+          </div>
+
+          <div>
+            <label>Pharmacy Address</label>
+            <input name="pharmacy_address_line_1"
+                   value="{html_escape(pharmacy.get('address_line_1'))}" />
+          </div>
+
+          <div>
+            <label>Pharmacy City</label>
+            <input name="pharmacy_city"
+                   value="{html_escape(pharmacy.get('city'))}" />
+          </div>
+
+          <div>
+            <label>Pharmacy State</label>
+            <input name="pharmacy_state"
+                   value="{html_escape(pharmacy.get('state'))}" />
+          </div>
+
+          <div>
+            <label>Pharmacy ZIP Code</label>
+            <input name="pharmacy_postal_code"
+                   value="{html_escape(pharmacy.get('postal_code'))}" />
+          </div>
+
+        </div>
+
+        <div style="margin-top:18px;">
+          <button type="submit"
+                  style="font-size:16px;padding:12px 18px;border-radius:18px;font-weight:800;">
+            Save Demographics & Pharmacy
+          </button>
+        </div>
+      </div>
+    </form>
+    """
+
+
+def physician_patient_style_history_html(chart_number: str, selected_packet_id: str) -> str:
+    conditions = physician_history_rows_from_db(chart_number)
+    allergies = physician_allergy_rows_from_db(chart_number)
+
+    existing = {}
+    for item in conditions:
+        existing[safe_str(item.get("condition_name")).lower()] = item
+
+    common_names = {safe_str(c).lower() for c in COMMON_HISTORY_CONDITIONS_PHYSICIAN}
+    seen_other = set()
+    other_lines = []
+
+    for item in conditions:
+        name = safe_str(item.get("condition_name"))
+        key = name.lower()
+        if not name or key in common_names or key in seen_other:
             continue
-        seen.add(key)
-        deduped.append(med)
+        seen_other.add(key)
+        other_lines.append(name)
 
-    total_rows = max(5, len(deduped))
     rows = []
-    for i in range(total_rows):
-        med = deduped[i] if i < len(deduped) else {}
-        name = safe_str(med.get("medication_name"))
-        dose = safe_str(med.get("strength") or med.get("dose_instructions"))
-        route = safe_str(med.get("route"))
-        frequency = safe_str(med.get("frequency"))
-        active_checked = "checked" if name and med.get("is_current") is True else ""
+
+    for cond in COMMON_HISTORY_CONDITIONS_PHYSICIAN:
+        item = existing.get(cond.lower()) or {}
+        form_key = cond.lower().replace(" ", "_")
 
         rows.append(
             f"""
+            <tr style="background:{'rgba(47,158,143,0.10)' if len(rows) % 2 == 0 else 'rgba(255,255,255,0.95)'};">
+              <td style="font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;">{html_escape(cond)}</td>
+              <td style="text-align:center;font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;">
+                <input type="checkbox" name="{html_escape(form_key)}_current" {"checked" if item.get("current_flag") else ""}>
+              </td>
+              <td style="text-align:center;font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;">
+                <input type="checkbox" name="{html_escape(form_key)}_past" {"checked" if item.get("past_flag") else ""}>
+              </td>
+              <td style="text-align:center;font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;">
+                <input type="checkbox" name="{html_escape(form_key)}_family" {"checked" if item.get("family_history_flag") else ""}>
+              </td>
+            </tr>
+            """
+        )
+
+    allergy_rows = []
+    total_allergy_rows = max(1, len(allergies))
+
+    for i in range(total_allergy_rows):
+        item = allergies[i] if i < len(allergies) else {}
+        allergen = safe_str(item.get("allergen"))
+        reaction = safe_str(item.get("reaction"))
+        severity = safe_str(item.get("severity")).lower()
+        active_checked = "checked" if allergen and item.get("is_active") is True else ""
+
+        def selected(value: str) -> str:
+            return "selected" if severity == value else ""
+
+        allergy_rows.append(
+            f"""
             <tr style="background:{'rgba(47,158,143,0.10)' if i % 2 == 0 else 'rgba(255,255,255,0.96)'};">
-              <td><input name="med_{i}_name" value="{html_escape(name)}" placeholder="Medication or supplement name" oninput="autoCheckMedicationRow(this)" /></td>
-              <td><input name="med_{i}_dose" value="{html_escape(dose)}" placeholder="Dose / strength" /></td>
+              <td><input name="allergy_{i}_allergen" value="{html_escape(allergen)}" placeholder="Allergen" oninput="autoCheckAllergyRow(this)" /></td>
+              <td><input name="allergy_{i}_reaction" value="{html_escape(reaction)}" placeholder="Reaction" /></td>
               <td>
-                <select name="med_{i}_route">
-                  <option value="">Select</option>
-                  <option value="oral" {selected_attr("oral", route)}>Oral</option>
-                  <option value="topical" {selected_attr("topical", route)}>Topical</option>
-                  <option value="injection" {selected_attr("injection", route)}>Injection</option>
+                <select name="allergy_{i}_severity" style="width:100%;padding:12px;border-radius:12px;border:1px solid #ccc;background:white;font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;font-size:15px;">
+                  <option value="" {selected("")}>Select</option>
+                  <option value="mild" {selected("mild")}>Mild</option>
+                  <option value="moderate" {selected("moderate")}>Moderate</option>
+                  <option value="severe" {selected("severe")}>Severe</option>
+                  <option value="life-threatening" {selected("life-threatening")}>Life-threatening</option>
                 </select>
               </td>
-              <td><input name="med_{i}_frequency" value="{html_escape(frequency)}" placeholder="How often?" /></td>
-              <td style="text-align:center;"><input type="checkbox" name="med_{i}_active" {active_checked} /></td>
+              <td style="text-align:center;"><input type="checkbox" name="allergy_{i}_active" {active_checked} /></td>
             </tr>
             """
         )
 
     return f"""
-    <form method="post" action="/patient/{html_escape(chart_number)}/medications?packet_id={html_escape(packet_id)}" autocomplete="off">
+      <form method="post" action="/patient/{html_escape(chart_number)}/history?packet_id={html_escape(selected_packet_id)}">
       <div class="card">
-        <h2 class="section-title">Medications & Supplements</h2>
-        <table>
-          <thead><tr><th>Name</th><th>Dose</th><th>Route</th><th>Frequency</th><th>Active</th></tr></thead>
-          <tbody id="medications-body">{''.join(rows)}</tbody>
-        </table>
-        <div style="margin-top:18px;display:flex;justify-content:flex-end;">
-          <button type="button" onclick="addMedicationRow()">Add Additional Row</button>
-        </div>
-        <p class="btnbar"><button type="submit">Save Medications</button></p>
-      </div>
-      <script>
-        let nextMedicationIndex = {total_rows};
+        <h2 class="section-title">Medical History</h2>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:18px;align-items:start;">
+          <table style="font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;">
+            <thead>
+              <tr>
+                <th>Condition</th>
+                <th>Current</th>
+                <th>Past</th>
+                <th>Family History</th>
+              </tr>
+            </thead>
+            <tbody>{''.join(rows[:(len(rows)+1)//2])}</tbody>
+          </table>
 
-        function autoCheckMedicationRow(input) {{
+          <table style="font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;">
+            <thead>
+              <tr>
+                <th>Condition</th>
+                <th>Current</th>
+                <th>Past</th>
+                <th>Family History</th>
+              </tr>
+            </thead>
+            <tbody>{''.join(rows[(len(rows)+1)//2:])}</tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:20px;">
+        <h2 class="section-title">Allergies</h2>
+        <table style="font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;">
+          <thead>
+            <tr>
+              <th>Allergen</th>
+              <th>Reaction</th>
+              <th>Severity</th>
+              <th>Active</th>
+            </tr>
+          </thead>
+          <tbody id="allergies-body">
+            {''.join(allergy_rows)}
+          </tbody>
+        </table>
+
+        <div style="margin-top:18px;display:flex;justify-content:flex-end;">
+          <button type="button" onclick="addAllergyRow()" style="font-size:15px;padding:10px 16px;border-radius:18px;font-weight:800;">
+            Add Another Row
+          </button>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:20px;">
+        <h2 class="section-title">Other Conditions</h2>
+        <textarea
+          name="other_conditions"
+          rows="8"
+          style="width:100%;padding:12px;border-radius:12px;border:1px solid #ccc;font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;font-size:15px;"
+          placeholder="Enter any additional diagnoses or medical conditions here."
+        >{html_escape(chr(10).join(other_lines))}</textarea>
+
+        <div style="margin-top:18px;">
+          <button type="submit" style="font-size:16px;padding:12px 18px;border-radius:18px;font-weight:800;">Save Medical History</button>
+        </div>
+      </div>
+
+      <script>
+        let nextAllergyIndex = {total_allergy_rows};
+
+        function allergySeverityOptions() {{
+          return `
+            <option value="">Select</option>
+            <option value="mild">Mild</option>
+            <option value="moderate">Moderate</option>
+            <option value="severe">Severe</option>
+            <option value="life-threatening">Life-threatening</option>
+          `;
+        }}
+
+        function autoCheckAllergyRow(input) {{
           const row = input.closest("tr");
           if (!row) return;
           const checkbox = row.querySelector("input[type='checkbox']");
           if (!checkbox) return;
-          checkbox.checked = input.value.trim().length > 0;
+          if (input.value.trim().length > 0) checkbox.checked = true;
+          if (input.value.trim().length === 0) checkbox.checked = false;
         }}
 
-        function addMedicationRow() {{
-          const body = document.getElementById("medications-body");
+        function addAllergyRow() {{
+          const body = document.getElementById("allergies-body");
           if (!body) return;
-          const i = nextMedicationIndex++;
+
+          const i = nextAllergyIndex++;
           const tr = document.createElement("tr");
           tr.style.background = i % 2 === 0 ? "rgba(47,158,143,0.10)" : "rgba(255,255,255,0.96)";
           tr.innerHTML = `
-            <td><input name="med_${{i}}_name" placeholder="Medication or supplement name" oninput="autoCheckMedicationRow(this)" /></td>
-            <td><input name="med_${{i}}_dose" placeholder="Dose / strength" /></td>
-            <td>
-              <select name="med_${{i}}_route">
-                <option value="">Select</option>
-                <option value="oral">Oral</option>
-                <option value="topical">Topical</option>
-                <option value="injection">Injection</option>
-              </select>
-            </td>
-            <td><input name="med_${{i}}_frequency" placeholder="How often?" /></td>
-            <td style="text-align:center;"><input type="checkbox" name="med_${{i}}_active" /></td>
+            <td><input name="allergy_${{i}}_allergen" value="" placeholder="Allergen" oninput="autoCheckAllergyRow(this)" /></td>
+            <td><input name="allergy_${{i}}_reaction" value="" placeholder="Reaction" /></td>
+            <td><select name="allergy_${i}_severity" style="width:100%;padding:12px;border-radius:12px;border:1px solid #ccc;background:white;font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;font-size:15px;">${{allergySeverityOptions()}}</select></td>
+            <td style="text-align:center;"><input type="checkbox" name="allergy_${{i}}_active" /></td>
           `;
           body.appendChild(tr);
         }}
       </script>
-    </form>
+      </form>
     """
-
-
-def social_form(chart_number: str, packet_id: str) -> str:
-    social = fetch_social(chart_number)
-
-    def opt(value: str, label: str, current: Any) -> str:
-        return f'<option value="{html_escape(value)}" {selected_attr(value, current)}>{html_escape(label)}</option>'
-
-    return f"""
-    <form method="post" action="/patient/{html_escape(chart_number)}/social?packet_id={html_escape(packet_id)}" autocomplete="off">
-      <div class="card">
-        <h2 class="section-title">Social History</h2>
-        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:18px;">
-          <div>
-            <label>Current Tobacco / Nicotine Use</label>
-            <select name="tobacco_status">
-              {opt("", "Select", social.get("tobacco_status"))}
-              {opt("never", "Never", social.get("tobacco_status"))}
-              {opt("current", "Current", social.get("tobacco_status"))}
-              {opt("former", "Former", social.get("tobacco_status"))}
-            </select>
-          </div>
-          <div>
-            <label>Previous Tobacco User?</label>
-            <select name="previous_tobacco_user">
-              {opt("", "Select", social.get("previous_tobacco_user"))}
-              {opt("yes", "Yes", social.get("previous_tobacco_user"))}
-              {opt("no", "No", social.get("previous_tobacco_user"))}
-            </select>
-          </div>
-          <div><label>Tobacco Products</label><input name="tobacco_products" value="{html_escape(social.get('tobacco_products'))}" placeholder="Cigarettes, vaping, cigars, chewing tobacco" /></div>
-          <div><label>Cigarette Packs Per Day</label><input name="cigarette_packs_per_day" value="{html_escape(social.get('cigarette_packs_per_day'))}" /></div>
-          <div>
-            <label>Alcohol Use</label>
-            <select name="alcohol_use">
-              {opt("", "Select", social.get("alcohol_use"))}
-              {opt("none", "None", social.get("alcohol_use"))}
-              {opt("1 drink per day", "1 drink per day", social.get("alcohol_use"))}
-              {opt("2 drinks per day", "2 drinks per day", social.get("alcohol_use"))}
-              {opt("3+ drinks per day", "3+ drinks per day", social.get("alcohol_use"))}
-            </select>
-          </div>
-          <div><label>Recreational Drug Use</label><input name="recreational_drug_use" value="{html_escape(social.get('recreational_drug_use') or social.get('drug_use'))}" /></div>
-          <div>
-            <label>Exercise</label>
-            <select name="exercise_level">
-              {opt("", "Select", social.get("exercise_level"))}
-              {opt("0 days/week", "0 days/week", social.get("exercise_level"))}
-              {opt("1-2 days/week", "1-2 days/week", social.get("exercise_level"))}
-              {opt("3-5 days/week", "3-5 days/week", social.get("exercise_level"))}
-              {opt("6-7 days/week", "6-7 days/week", social.get("exercise_level"))}
-            </select>
-          </div>
-          <div><label>Occupation</label><input name="occupation" value="{html_escape(social.get('occupation'))}" /></div>
-          <div>
-            <label>Sexually Active?</label>
-            <select name="sexually_active">
-              {opt("", "Select", social.get("sexually_active"))}
-              {opt("yes", "Yes", social.get("sexually_active"))}
-              {opt("no", "No", social.get("sexually_active"))}
-            </select>
-          </div>
-          <div><label>If sexually active, how many partners do you currently have?</label><input name="sexual_partners_count" value="{html_escape(social.get('sexual_partners_count'))}" /></div>
-          <div>
-            <label>Uses Protection?</label>
-            <select name="uses_protection">
-              {opt("", "Select", social.get("uses_protection"))}
-              {opt("yes", "Yes", social.get("uses_protection"))}
-              {opt("no", "No", social.get("uses_protection"))}
-            </select>
-          </div>
-          <div><label>Protection Type</label><input name="protection_type" value="{html_escape(social.get('protection_type'))}" /></div>
-        </div>
-        <p class="btnbar"><button type="submit">Save Social History</button></p>
-      </div>
-    </form>
-    """
-
-
-@app.get("/healthz")
-async def healthz() -> PlainTextResponse:
-    return PlainTextResponse("ok")
-
-
-@app.get("/login", response_class=HTMLResponse)
-async def login_page() -> str:
-    return shell(
-        "CallCare Physician Login",
-        """
-        <div class="hero">
-          <h1>CallCare Physician Portal</h1>
-          <p>Physician review workspace.</p>
-        </div>
-        <div class="card" style="max-width:700px;margin:0 auto;">
-          <h2 style="margin-top:0;">Log In</h2>
-          <form method="post" action="/login">
-            <label>Username</label>
-            <input name="username" autocomplete="off" />
-            <label>Password</label>
-            <input name="password" type="password" autocomplete="current-password" />
-            <button type="submit">Log In</button>
-          </form>
-        </div>
-        """,
-    )
-
-
-@app.post("/login")
-async def login(username: str = Form(...), password: str = Form(...)) -> RedirectResponse:
-    if CALLCARE_PHYSICIAN_USERNAME and username != CALLCARE_PHYSICIAN_USERNAME:
-        return RedirectResponse(url="/login", status_code=303)
-    if CALLCARE_PHYSICIAN_PASSWORD and password != CALLCARE_PHYSICIAN_PASSWORD:
-        return RedirectResponse(url="/login", status_code=303)
-
-    token = make_session_token()
-    SESSIONS[token] = {"username": username}
-    response = RedirectResponse(url="/", status_code=303)
-    response.set_cookie("callcare_physician_session", token, httponly=True, samesite="lax", path="/", secure=True)
-    return response
-
-
-@app.get("/logout")
-async def logout(request: Request) -> RedirectResponse:
-    token = request.cookies.get("callcare_physician_session", "")
-    if token in SESSIONS:
-        del SESSIONS[token]
-    response = RedirectResponse(url="/login", status_code=303)
-    response.delete_cookie("callcare_physician_session", path="/")
-    return response
-
-
-@app.get("/", response_class=HTMLResponse)
-async def home(request: Request) -> str:
-    require_session(request)
-    groups = patient_groups()
-
-    rows = []
-    for g in groups:
-        latest = g["encounters"][0]
-        meta = latest["meta"]
-        patient_ctx = latest["patient_ctx"] or {}
-        rows.append(
-            f"<tr>"
-            f"<td><a href='/patient/{html_escape(g['chart_number'])}'>{html_escape(g['patient_name'])}</a></td>"
-            f"<td>{html_escape(g['chart_number'])}</td>"
-            f"<td>{len(g['encounters'])}</td>"
-            f"<td>{html_escape(safe_str(patient_ctx.get('chief_complaint')))}</td>"
-            f"<td>{html_escape(safe_str(meta.get('status')))}</td>"
-            f"<td>{html_escape(safe_str(meta.get('prescription_status')))}</td>"
-            f"</tr>"
-        )
-
-    if not rows:
-        body = """
-        <div class="hero">
-          <h1>CallCare Physician Portal</h1>
-          <p>No routed review packets yet.</p>
-        </div>
-        <p><a href="/logout">Log out</a></p>
-        """
-    else:
-        body = f"""
-        <div class="hero">
-          <h1>CallCare Physician Portal</h1>
-          <p>Physician review queue with linked patient charts, signed notes, addenda, and delivery tracking.</p>
-        </div>
-        <p><a href="/logout">Log out</a></p>
-        <div class="card">
-          <table>
-            <thead>
-              <tr>
-                <th>Patient</th>
-                <th>Chart #</th>
-                <th>Encounters</th>
-                <th>Latest Chief Complaint</th>
-                <th>Status</th>
-                <th>Prescription</th>
-              </tr>
-            </thead>
-            <tbody>{''.join(rows)}</tbody>
-          </table>
-        </div>
-        """
-
-    return shell("CallCare Physician Portal", body)
-
-
-@app.get("/packet/{packet_id}", response_class=HTMLResponse)
-async def legacy_packet_redirect(packet_id: str, request: Request) -> RedirectResponse:
-    require_session(request)
-    path = packet_path(packet_id)
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Packet not found")
-    bundle = packet_bundle(path)
-    if not bundle:
-        raise HTTPException(status_code=404, detail="Packet bundle not found")
-    chart_number = safe_str((bundle.get("patient_ctx") or {}).get("chart_number"))
-    if not chart_number:
-        raise HTTPException(status_code=404, detail="Patient chart not linked")
-    return RedirectResponse(url=f"/patient/{chart_number}?packet_id={packet_id}&tab=encounters", status_code=303)
-
-
-@app.get("/patient/{chart_number}", response_class=HTMLResponse)
-async def patient_chart(
-    chart_number: str,
-    request: Request,
-    packet_id: Optional[str] = Query(default=None),
-    tab: str = Query(default="encounters"),
-) -> str:
-    require_session(request)
-
-    groups = patient_groups()
-    group = next((g for g in groups if g["chart_number"] == chart_number), None)
-    if not group:
-        raise HTTPException(status_code=404, detail="Patient chart not found")
-
-    patient_ctx = group["patient_ctx"] or {}
-    encounters = group["encounters"]
-
-    selected_bundle = None
-    if packet_id:
-        selected_bundle = next((e for e in encounters if e["packet_id"] == packet_id), None)
-    if not selected_bundle and encounters:
-        selected_bundle = encounters[0]
-    if not selected_bundle:
-        raise HTTPException(status_code=404, detail="No encounters found")
-
-    selected_packet_id = selected_bundle["packet_id"]
-    selected_packet = selected_bundle["packet"]
-    selected_meta = selected_bundle["meta"]
-    selected_note = safe_str(selected_packet.get("note_text"))
-    selected_signed_note = signed_note_text(selected_note, selected_meta)
-    selected_spoken_summary = selected_bundle["spoken_summary"]
-
-    if safe_str(selected_meta.get("status")) == "active":
-        selected_meta["status"] = "under review"
-        save_meta(selected_packet_id, selected_meta)
-
-    encounter_tab_links = []
-    for enc in encounters:
-        enc_ctx = enc.get("patient_ctx") or {}
-        label = _extract_differential_title(
-            safe_str((enc.get("packet") or {}).get("note_text")),
-            safe_str(enc_ctx.get("chief_complaint")),
-        )
-        started = encounter_when(safe_str(enc_ctx.get("encounter_started_at")), safe_str(enc.get("created_at")))
-        active_class = "enc-link active" if enc["packet_id"] == selected_packet_id else "enc-link"
-        encounter_tab_links.append(
-            f"<li><a class='{active_class}' href='/patient/{html_escape(chart_number)}?packet_id={html_escape(enc['packet_id'])}&tab=encounters'>{html_escape(label)} — {html_escape(started)}</a></li>"
-        )
-    encounter_tab_html = "<ul>" + "".join(encounter_tab_links) + "</ul>"
-
-    demographics_panel = demographics_form(chart_number, selected_packet_id)
-    pmh_panel = history_form(chart_number, selected_packet_id)
-    social_panel = social_form(chart_number, selected_packet_id)
-    medications_panel = medications_form(chart_number, selected_packet_id)
-
-    note_editor_html = (
-        f"""
-        <form method="post" action="/packet/{html_escape(selected_packet_id)}/update-note">
-          <textarea class="note-textarea" id="note_text_editor" name="note_text">{html_escape(selected_note)}</textarea>
-          <p class="btnbar"><button type="submit">Save Note Changes</button></p>
-        </form>
-        """
-        if not selected_meta.get("signed")
-        else f"""
-        <div class="readonly">{html_escape(selected_signed_note)}</div>
-        <p><em>Signed notes are read-only.</em></p>
-        """
-    )
-
-    addenda_html = ""
-    addenda = selected_meta.get("addenda") or []
-    if addenda:
-        addenda_html += "<div class='card'><h2 class='section-title'>Signed Addenda</h2>"
-        for idx, add in enumerate(addenda, 1):
-            addenda_html += f"<div class='readonly' style='margin-bottom:12px;'><strong>Addendum {idx}</strong>\n\n{html_escape(addendum_block(add))}</div>"
-        addenda_html += "</div>"
-
-    addendum_editor_html = (
-        f"""
-        <div class="card">
-          <h2 class="section-title">Add Addendum</h2>
-          <form method="post" action="/packet/{html_escape(selected_packet_id)}/addendum">
-            <textarea name="addendum_text" style="min-height:180px;"></textarea>
-            <p class="btnbar"><button type="submit">Sign Addendum</button></p>
-          </form>
-        </div>
-        """
-        if selected_meta.get("signed")
-        else ""
-    )
-
-    encounter_panel = f"""
-      <div class="card">
-        <h2 class="section-title">{html_escape(patient_ctx.get('patient_name'))}</h2>
-        <div class="meta-grid">
-          <div class="metric"><div class="label">Chart #</div><div class="value">{html_escape(patient_ctx.get('chart_number'))}</div></div>
-          <div class="metric"><div class="label">Date of Birth</div><div class="value">{html_escape(patient_ctx.get('date_of_birth'))}</div></div>
-          <div class="metric"><div class="label">Sex at Birth</div><div class="value">{html_escape(patient_ctx.get('sex_at_birth'))}</div></div>
-          <div class="metric"><div class="label">Chief Complaint</div><div class="value">{html_escape((selected_bundle.get('patient_ctx') or {}).get('chief_complaint'))}</div></div>
-          <div class="metric"><div class="label">Encounter Started</div><div class="value">{html_escape((selected_bundle.get('patient_ctx') or {}).get('encounter_started_at') or selected_bundle.get('created_at'))}</div></div>
-          <div class="metric"><div class="label">Status</div><div class="value">{html_escape(selected_meta.get('status'))}</div></div>
-        </div>
-        <p class="pill">Prescription: {html_escape(selected_meta.get('prescription_status'))}</p>
-        <p class="pill">Delivery: {html_escape(selected_meta.get('note_sent'))}</p>
-        <div class="btnbar">
-          <form method="get" action="/packet/{html_escape(selected_packet_id)}/full-text">
-            <button class="btn-soft" type="submit">Full Transcript</button>
-          </form>
-        </div>
-      </div>
-
-      <div class="card">
-        <h2 class="section-title">Clinical Note</h2>
-        {note_editor_html}
-      </div>
-
-      <div class="card">
-        <h2 class="section-title">Spoken Summary to Patient</h2>
-        <div class="readonly">{html_escape(selected_spoken_summary or 'No spoken summary available.')}</div>
-        <h3 style="margin-top:18px;">Physician's Comments on Spoken Summary</h3>
-        {(
-          f'<div class="readonly">{html_escape(selected_meta.get("spoken_summary_comments") or "No physician comments on spoken summary.")}</div><p><em>Signed notes lock spoken-summary comments. Use an addendum for any later changes.</em></p>'
-          if selected_meta.get("signed")
-          else
-          f'<form method="post" action="/packet/{html_escape(selected_packet_id)}/update-spoken-summary-comments"><textarea id="spoken_summary_comments_editor" name="spoken_summary_comments" style="min-height:180px;">{html_escape(selected_meta.get("spoken_summary_comments"))}</textarea><p class="btnbar"><button type="submit">Save Spoken Summary Comments</button></p></form>'
-        )}
-      </div>
-
-      {addenda_html}
-      {addendum_editor_html}
-
-      <div class="card">
-        <h2 class="section-title">Physician Actions</h2>
-        <div class="btnbar">
-          {'' if selected_meta.get("signed") else f'<form method="post" action="/packet/{html_escape(selected_packet_id)}/sign"><button type="submit">Sign Note</button></form>'}
-          <form method="post" action="/packet/{html_escape(selected_packet_id)}/prescribe"><button type="submit">Send Prescription</button></form>
-          <form method="post" action="/packet/{html_escape(selected_packet_id)}/note-sent/to-be-mailed"><button type="submit">Mark Note To Be Mailed</button></form>
-        </div>
-      </div>
-    """
-
-    panel_html = {
-        "demographics": demographics_panel,
-        "pmh": pmh_panel,
-        "social": social_panel,
-        "medications": medications_panel,
-        "encounters": encounter_panel,
-    }.get(tab, encounter_panel)
-
-    def tab_link(tab_name: str, label: str) -> str:
-        active = "tab active" if tab == tab_name else "tab"
-        return f"<a class='{active}' href='/patient/{html_escape(chart_number)}?packet_id={html_escape(selected_packet_id)}&tab={html_escape(tab_name)}'>{html_escape(label)}</a>"
-
-    _sync_bundle_to_shared_db(selected_bundle)
-
-    return shell(
-        f"{safe_str(patient_ctx.get('patient_name'))} - CallCare Physician Portal",
-        f"""
-        <div class="hero">
-          <h1>{html_escape(patient_ctx.get('patient_name'))}</h1>
-          <p>Chart #{html_escape(patient_ctx.get('chart_number'))} · Physician review workspace</p>
-        </div>
-
-        <p><a href="/">← Back to patient list</a> | <a href="/logout">Log out</a></p>
-
-        <div class="tabs">
-          {tab_link("demographics", "Demographics & Pharmacy")}
-          {tab_link("pmh", "Medical History")}
-          {tab_link("social", "Social History")}
-          {tab_link("medications", "Medications")}
-          {tab_link("encounters", "Encounters")}
-        </div>
-
-        <div class="layout">
-          <div class="card sidebar">
-            <h3 style="margin-top:0;">Encounters</h3>
-            {encounter_tab_html}
-          </div>
-          <div class="grid">
-            {panel_html}
-          </div>
-        </div>
-        """,
-    )
-
-
-@app.post("/patient/{chart_number}/demographics")
-async def save_demographics(chart_number: str, request: Request, packet_id: str = Query(default="")) -> RedirectResponse:
-    require_session(request)
-    form = await request.form()
-
-    with db_connect() as conn:
-        with conn.cursor() as cur:
-            patient_id = patient_id_for_chart(cur, chart_number)
-
-            cur.execute(
-                """
-                UPDATE callcare.patients
-                SET preferred_name = NULLIF(%s, ''),
-                    sex_at_birth = NULLIF(%s, ''),
-                    gender_identity = NULLIF(%s, ''),
-                    phone_number = NULLIF(%s, ''),
-                    email = NULLIF(%s, '')
-                WHERE id = %s::uuid
-                """,
-                (
-                    safe_str(form.get("preferred_name")),
-                    safe_str(form.get("sex_at_birth")),
-                    safe_str(form.get("gender_identity")),
-                    safe_str(form.get("phone_number")),
-                    safe_str(form.get("email")),
-                    patient_id,
-                ),
-            )
-
-            cur.execute(
-                """
-                INSERT INTO callcare.patient_addresses (
-                  id, patient_id, address_line_1, address_line_2, city, state, postal_code, county_name
-                )
-                VALUES (
-                  gen_random_uuid(), %s::uuid, %s, NULLIF(%s, ''), %s, %s, %s, NULLIF(%s, '')
-                )
-                """,
-                (
-                    patient_id,
-                    safe_str(form.get("address_line_1")) or "Not provided",
-                    safe_str(form.get("address_line_2")),
-                    safe_str(form.get("city")) or "Not provided",
-                    safe_str(form.get("state")) or "GA",
-                    safe_str(form.get("postal_code")) or "00000",
-                    safe_str(form.get("county_name")),
-                ),
-            )
-
-            cur.execute(
-                """
-                INSERT INTO callcare.patient_vitals (
-                  id, patient_id, height_feet, height_inches, weight_lbs, source, created_at, updated_at
-                )
-                VALUES (
-                  gen_random_uuid(), %s::uuid, NULLIF(%s, '')::integer, NULLIF(%s, '')::integer,
-                  NULLIF(%s, '')::numeric, 'physician_portal', now(), now()
-                )
-                """,
-                (
-                    patient_id,
-                    safe_str(form.get("height_feet")),
-                    safe_str(form.get("height_inches")),
-                    safe_str(form.get("weight_lbs")),
-                ),
-            )
-
-            pharmacy_name = safe_str(form.get("pharmacy_name"))
-            if pharmacy_name:
-                cur.execute(
-                    """
-                    INSERT INTO callcare.pharmacies (
-                      id, name, address_line_1, city, state, postal_code, phone, fax, created_at
-                    )
-                    VALUES (
-                      gen_random_uuid(), %s, NULLIF(%s, ''), NULLIF(%s, ''), NULLIF(%s, ''),
-                      NULLIF(%s, ''), NULLIF(%s, ''), NULLIF(%s, ''), now()
-                    )
-                    RETURNING id::text
-                    """,
-                    (
-                        pharmacy_name,
-                        safe_str(form.get("pharmacy_address_line_1")),
-                        safe_str(form.get("pharmacy_city")),
-                        safe_str(form.get("pharmacy_state")),
-                        safe_str(form.get("pharmacy_postal_code")),
-                        safe_str(form.get("pharmacy_phone")),
-                        safe_str(form.get("pharmacy_fax")),
-                    ),
-                )
-                pharmacy_id = cur.fetchone()["id"]
-
-                cur.execute(
-                    "UPDATE callcare.patient_pharmacies SET is_preferred = false WHERE patient_id = %s::uuid",
-                    (patient_id,),
-                )
-
-                cur.execute(
-                    """
-                    INSERT INTO callcare.patient_pharmacies (
-                      id, patient_id, pharmacy_id, is_preferred, created_at
-                    )
-                    VALUES (
-                      gen_random_uuid(), %s::uuid, %s::uuid, true, now()
-                    )
-                    ON CONFLICT (patient_id, pharmacy_id)
-                    DO UPDATE SET is_preferred = true
-                    """,
-                    (patient_id, pharmacy_id),
-                )
-
-            audit_event(cur, patient_id, "patient_demographics_pharmacy_updated_by_physician", {"source": "physician_portal"})
-
-        conn.commit()
-
-    return RedirectResponse(url=f"/patient/{chart_number}?packet_id={packet_id}&tab=demographics", status_code=303)
 
 
 @app.post("/patient/{chart_number}/history")
-async def save_history(chart_number: str, request: Request, packet_id: str = Query(default="")) -> RedirectResponse:
+async def save_physician_history(
+    chart_number: str,
+    request: Request,
+    packet_id: str = Query(default=""),
+) -> RedirectResponse:
     require_session(request)
     form = await request.form()
 
+    if not CALLCARE_SHARED_DATABASE_URL:
+        raise HTTPException(status_code=500, detail="Missing shared database URL")
+
     condition_rows = []
-    for cond in COMMON_HISTORY_CONDITIONS:
+    for cond in COMMON_HISTORY_CONDITIONS_PHYSICIAN:
         key = cond.lower().replace(" ", "_")
         current_flag = safe_str(form.get(f"{key}_current")).lower() == "on"
         past_flag = safe_str(form.get(f"{key}_past")).lower() == "on"
@@ -1519,16 +1597,35 @@ async def save_history(chart_number: str, request: Request, packet_id: str = Que
         allergen = safe_str(form.get(f"allergy_{i}_allergen")).strip()
         if not allergen:
             continue
+
+        reaction = safe_str(form.get(f"allergy_{i}_reaction")).strip()
+        severity = safe_str(form.get(f"allergy_{i}_severity")).strip()
+        active = safe_str(form.get(f"allergy_{i}_active")).lower() == "on"
+
         allergy_rows.append({
             "allergen": allergen,
-            "reaction": safe_str(form.get(f"allergy_{i}_reaction")),
-            "severity": safe_str(form.get(f"allergy_{i}_severity")),
-            "active": safe_str(form.get(f"allergy_{i}_active")).lower() == "on",
+            "reaction": reaction,
+            "severity": severity,
+            "active": active,
         })
 
-    with db_connect() as conn:
+    with psycopg.connect(CALLCARE_SHARED_DATABASE_URL, row_factory=dict_row) as conn:
         with conn.cursor() as cur:
-            patient_id = patient_id_for_chart(cur, chart_number)
+            cur.execute(
+                """
+                SELECT id::text AS patient_id
+                FROM callcare.patients
+                WHERE chart_number = %s
+                  AND archived_at IS NULL
+                LIMIT 1
+                """,
+                (chart_number,),
+            )
+            patient = cur.fetchone()
+            if not patient:
+                raise HTTPException(status_code=404, detail="Patient not found")
+
+            patient_id = patient["patient_id"]
 
             cur.execute(
                 """
@@ -1544,12 +1641,30 @@ async def save_history(chart_number: str, request: Request, packet_id: str = Que
                 cur.execute(
                     """
                     INSERT INTO callcare.patient_conditions (
-                      id, patient_id, condition_name, current_flag, past_flag,
-                      family_history_flag, notes, source, verification_status, created_at, updated_at
+                      id,
+                      patient_id,
+                      condition_name,
+                      current_flag,
+                      past_flag,
+                      family_history_flag,
+                      notes,
+                      source,
+                      verification_status,
+                      created_at,
+                      updated_at
                     )
                     VALUES (
-                      gen_random_uuid(), %s::uuid, %s, %s, %s, %s, NULLIF(%s, ''),
-                      'physician_portal', 'physician_verified', now(), now()
+                      gen_random_uuid(),
+                      %s::uuid,
+                      %s,
+                      %s,
+                      %s,
+                      %s,
+                      NULLIF(%s, ''),
+                      'physician_portal',
+                      'physician_verified',
+                      now(),
+                      now()
                     )
                     """,
                     (
@@ -1562,182 +1677,527 @@ async def save_history(chart_number: str, request: Request, packet_id: str = Que
                     ),
                 )
 
-            cur.execute("DELETE FROM callcare.patient_allergies WHERE patient_id = %s::uuid", (patient_id,))
-            for row in allergy_rows:
+            cur.execute(
+                """
+                DELETE FROM callcare.patient_allergies
+                WHERE patient_id = %s::uuid
+                """,
+                (patient_id,),
+            )
+
+            for allergy in allergy_rows:
                 cur.execute(
                     """
                     INSERT INTO callcare.patient_allergies (
-                      id, patient_id, allergen, reaction, severity, is_active,
-                      source, verification_status, created_at, updated_at
+                      id,
+                      patient_id,
+                      allergen,
+                      reaction,
+                      severity,
+                      is_active,
+                      source,
+                      verification_status,
+                      created_at,
+                      updated_at
                     )
                     VALUES (
-                      gen_random_uuid(), %s::uuid, %s, NULLIF(%s, ''), NULLIF(%s, ''),
-                      %s, 'physician_portal', 'physician_verified', now(), now()
+                      gen_random_uuid(),
+                      %s::uuid,
+                      %s,
+                      NULLIF(%s, ''),
+                      NULLIF(%s, ''),
+                      %s,
+                      'physician_portal',
+                      'physician_verified',
+                      now(),
+                      now()
                     )
                     """,
                     (
                         patient_id,
-                        row["allergen"],
-                        row["reaction"],
-                        row["severity"],
-                        row["active"],
+                        allergy["allergen"],
+                        allergy["reaction"],
+                        allergy["severity"],
+                        allergy["active"],
                     ),
                 )
 
-            audit_event(
-                cur,
-                patient_id,
-                "patient_history_allergies_updated_by_physician",
-                {"source": "physician_portal", "condition_count": len(condition_rows), "allergy_count": len(allergy_rows)},
+            cur.execute(
+                """
+                INSERT INTO callcare.audit_events (
+                  id,
+                  actor_type,
+                  actor_id,
+                  patient_id,
+                  encounter_id,
+                  event_type,
+                  event_json,
+                  created_at
+                )
+                VALUES (
+                  gen_random_uuid(),
+                  'physician',
+                  NULL,
+                  %s::uuid,
+                  NULL,
+                  'patient_history_allergies_updated_by_physician',
+                  jsonb_build_object(
+                    'source', 'physician_portal',
+                    'condition_count', %s,
+                    'allergy_count', %s
+                  ),
+                  now()
+                )
+                """,
+                (patient_id, len(condition_rows), len(allergy_rows)),
             )
 
         conn.commit()
 
-    return RedirectResponse(url=f"/patient/{chart_number}?packet_id={packet_id}&tab=pmh", status_code=303)
+    return RedirectResponse(
+        url=f"/patient/{chart_number}?packet_id={packet_id}&tab=pmh",
+        status_code=303,
+    )
 
 
-@app.post("/patient/{chart_number}/medications")
-async def save_medications(chart_number: str, request: Request, packet_id: str = Query(default="")) -> RedirectResponse:
+
+@app.post("/patient/{chart_number}/demographics")
+async def save_physician_demographics(
+    chart_number: str,
+    request: Request,
+    packet_id: str = Query(default=""),
+) -> RedirectResponse:
     require_session(request)
     form = await request.form()
 
-    rows = []
-    for i in range(50):
-        name = safe_str(form.get(f"med_{i}_name")).strip()
-        if not name:
-            continue
-        rows.append({
-            "name": name,
-            "dose": safe_str(form.get(f"med_{i}_dose")),
-            "route": safe_str(form.get(f"med_{i}_route")),
-            "frequency": safe_str(form.get(f"med_{i}_frequency")),
-            "active": safe_str(form.get(f"med_{i}_active")).lower() == "on",
-        })
+    if not CALLCARE_SHARED_DATABASE_URL:
+        raise HTTPException(status_code=500, detail="Missing shared database URL")
 
-    with db_connect() as conn:
+    with psycopg.connect(CALLCARE_SHARED_DATABASE_URL, row_factory=dict_row) as conn:
         with conn.cursor() as cur:
-            patient_id = patient_id_for_chart(cur, chart_number)
-            cur.execute("DELETE FROM callcare.patient_medications WHERE patient_id = %s::uuid", (patient_id,))
-
-            for row in rows:
-                cur.execute(
-                    """
-                    INSERT INTO callcare.patient_medications (
-                      id, patient_id, medication_name, strength, dose_instructions, route,
-                      frequency, is_current, start_date, end_date, source,
-                      verification_status, created_at, updated_at
-                    )
-                    VALUES (
-                      gen_random_uuid(), %s::uuid, %s, NULLIF(%s, ''), NULLIF(%s, ''),
-                      NULLIF(%s, ''), NULLIF(%s, ''), %s, CURRENT_DATE,
-                      CASE WHEN %s THEN NULL ELSE CURRENT_DATE END,
-                      'physician_portal', 'physician_verified', now(), now()
-                    )
-                    """,
-                    (
-                        patient_id,
-                        row["name"],
-                        row["dose"],
-                        row["dose"],
-                        row["route"],
-                        row["frequency"],
-                        row["active"],
-                        row["active"],
-                    ),
-                )
-
-            audit_event(cur, patient_id, "patient_medications_updated_by_physician", {"source": "physician_portal", "medication_count": len(rows)})
-
-        conn.commit()
-
-    return RedirectResponse(url=f"/patient/{chart_number}?packet_id={packet_id}&tab=medications", status_code=303)
-
-
-@app.post("/patient/{chart_number}/social")
-async def save_social(chart_number: str, request: Request, packet_id: str = Query(default="")) -> RedirectResponse:
-    require_session(request)
-    form = await request.form()
-
-    with db_connect() as conn:
-        with conn.cursor() as cur:
-            patient_id = patient_id_for_chart(cur, chart_number)
-            cur.execute("DELETE FROM callcare.patient_social_history_structured WHERE patient_id = %s::uuid", (patient_id,))
             cur.execute(
                 """
-                INSERT INTO callcare.patient_social_history_structured (
-                  patient_id, tobacco_status, alcohol_use, drug_use, exercise_level, occupation,
-                  sexually_active, sexual_partners_count, uses_protection, protection_type,
-                  previous_tobacco_user, tobacco_products, cigarette_packs_per_day,
-                  recreational_drug_use, created_at, updated_at
+                SELECT id::text AS patient_id
+                FROM callcare.patients
+                WHERE chart_number = %s
+                  AND archived_at IS NULL
+                LIMIT 1
+                """,
+                (chart_number,),
+            )
+            patient = cur.fetchone()
+            if not patient:
+                raise HTTPException(status_code=404, detail="Patient not found")
+
+            patient_id = patient["patient_id"]
+
+            cur.execute(
+                """
+                UPDATE callcare.patients
+                SET
+                  preferred_name = NULLIF(%s, ''),
+                  sex_at_birth = NULLIF(%s, ''),
+                  gender_identity = NULLIF(%s, ''),
+                  phone_number = NULLIF(%s, ''),
+                  email = NULLIF(%s, '')
+                WHERE id = %s::uuid
+                """,
+                (
+                    safe_str(form.get("preferred_name")),
+                    safe_str(form.get("sex_at_birth")),
+                    safe_str(form.get("gender_identity")),
+                    safe_str(form.get("phone_number")),
+                    safe_str(form.get("email")),
+                    patient_id,
+                ),
+            )
+
+            cur.execute(
+                """
+                INSERT INTO callcare.patient_addresses (
+                  id,
+                  patient_id,
+                  address_line_1,
+                  address_line_2,
+                  city,
+                  state,
+                  postal_code,
+                  county_name
                 )
                 VALUES (
-                  %s::uuid, NULLIF(%s, ''), NULLIF(%s, ''), NULLIF(%s, ''), NULLIF(%s, ''),
-                  NULLIF(%s, ''), NULLIF(%s, ''), NULLIF(%s, '')::integer, NULLIF(%s, ''),
-                  NULLIF(%s, ''), NULLIF(%s, ''), NULLIF(%s, ''), NULLIF(%s, '')::numeric,
-                  NULLIF(%s, ''), now(), now()
+                  gen_random_uuid(),
+                  %s::uuid,
+                  %s,
+                  NULLIF(%s, ''),
+                  %s,
+                  %s,
+                  %s,
+                  NULLIF(%s, '')
                 )
                 """,
                 (
                     patient_id,
-                    safe_str(form.get("tobacco_status")),
-                    safe_str(form.get("alcohol_use")),
-                    safe_str(form.get("recreational_drug_use")),
-                    safe_str(form.get("exercise_level")),
-                    safe_str(form.get("occupation")),
-                    safe_str(form.get("sexually_active")),
-                    safe_str(form.get("sexual_partners_count")),
-                    safe_str(form.get("uses_protection")),
-                    safe_str(form.get("protection_type")),
-                    safe_str(form.get("previous_tobacco_user")),
-                    safe_str(form.get("tobacco_products")),
-                    safe_str(form.get("cigarette_packs_per_day")),
-                    safe_str(form.get("recreational_drug_use")),
+                    safe_str(form.get("address_line_1")) or "Not provided",
+                    safe_str(form.get("address_line_2")),
+                    safe_str(form.get("city")) or "Not provided",
+                    safe_str(form.get("state")) or "GA",
+                    safe_str(form.get("postal_code")) or "00000",
+                    safe_str(form.get("county_name")),
                 ),
             )
 
-            audit_event(cur, patient_id, "patient_social_history_updated_by_physician", {"source": "physician_portal"})
+            cur.execute(
+                """
+                INSERT INTO callcare.patient_vitals (
+                  id,
+                  patient_id,
+                  height_feet,
+                  height_inches,
+                  weight_lbs,
+                  source,
+                  created_at,
+                  updated_at
+                )
+                VALUES (
+                  gen_random_uuid(),
+                  %s::uuid,
+                  NULLIF(%s, '')::integer,
+                  NULLIF(%s, '')::integer,
+                  NULLIF(%s, '')::numeric,
+                  'physician_portal',
+                  now(),
+                  now()
+                )
+                """,
+                (
+                    patient_id,
+                    safe_str(form.get("height_feet")),
+                    safe_str(form.get("height_inches")),
+                    safe_str(form.get("weight_lbs")),
+                ),
+            )
+
+            pharmacy_name = safe_str(form.get("pharmacy_name"))
+            if pharmacy_name:
+                cur.execute(
+                    """
+                    INSERT INTO callcare.pharmacies (
+                      id,
+                      name,
+                      address_line_1,
+                      city,
+                      state,
+                      postal_code,
+                      phone,
+                      fax,
+                      created_at
+                    )
+                    VALUES (
+                      gen_random_uuid(),
+                      %s,
+                      NULLIF(%s, ''),
+                      NULLIF(%s, ''),
+                      NULLIF(%s, ''),
+                      NULLIF(%s, ''),
+                      NULLIF(%s, ''),
+                      NULLIF(%s, ''),
+                      now()
+                    )
+                    RETURNING id::text
+                    """,
+                    (
+                        pharmacy_name,
+                        safe_str(form.get("pharmacy_address_line_1")),
+                        safe_str(form.get("pharmacy_city")),
+                        safe_str(form.get("pharmacy_state")),
+                        safe_str(form.get("pharmacy_postal_code")),
+                        safe_str(form.get("pharmacy_phone")),
+                        safe_str(form.get("pharmacy_fax")),
+                    ),
+                )
+                pharmacy = cur.fetchone()
+                pharmacy_id = pharmacy["id"]
+
+                cur.execute(
+                    """
+                    UPDATE callcare.patient_pharmacies
+                    SET is_preferred = false
+                    WHERE patient_id = %s::uuid
+                    """,
+                    (patient_id,),
+                )
+
+                cur.execute(
+                    """
+                    INSERT INTO callcare.patient_pharmacies (
+                      id,
+                      patient_id,
+                      pharmacy_id,
+                      is_preferred,
+                      created_at,
+                      updated_at
+                    )
+                    VALUES (
+                      gen_random_uuid(),
+                      %s::uuid,
+                      %s::uuid,
+                      true,
+                      now(),
+                      now()
+                    )
+                    """,
+                    (patient_id, pharmacy_id),
+                )
+
+            cur.execute(
+                """
+                INSERT INTO callcare.audit_events (
+                  id,
+                  actor_type,
+                  actor_id,
+                  patient_id,
+                  encounter_id,
+                  event_type,
+                  event_json,
+                  created_at
+                )
+                VALUES (
+                  gen_random_uuid(),
+                  'physician',
+                  NULL,
+                  %s::uuid,
+                  NULL,
+                  'patient_demographics_pharmacy_updated_by_physician',
+                  jsonb_build_object('source', 'physician_portal'),
+                  now()
+                )
+                """,
+                (patient_id,),
+            )
 
         conn.commit()
 
-    return RedirectResponse(url=f"/patient/{chart_number}?packet_id={packet_id}&tab=social", status_code=303)
+    return RedirectResponse(
+        url=f"/patient/{chart_number}?packet_id={packet_id}&tab=demographics",
+        status_code=303,
+    )
 
 
-@app.get("/packet/{packet_id}/full-text", response_class=HTMLResponse)
-async def full_text(packet_id: str, request: Request) -> str:
+@app.get("/patient/{chart_number}", response_class=HTMLResponse)
+async def patient_chart(
+    chart_number: str,
+    request: Request,
+    packet_id: Optional[str] = Query(default=None),
+    tab: str = Query(default="encounters"),
+) -> str:
     require_session(request)
-    path = packet_path(packet_id)
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Packet not found")
 
-    bundle = packet_bundle(path)
-    if not bundle:
-        raise HTTPException(status_code=404, detail="Packet bundle not found")
+    patient_ctx = get_patient_context(chart_number)
+    if not patient_ctx:
+        raise HTTPException(status_code=404, detail="Patient chart not found")
 
-    call_log = bundle["call_log"]
-    transcript = call_log.get("transcript", []) if isinstance(call_log, dict) else []
+    encounters = get_encounters(chart_number)
+    if not encounters:
+        raise HTTPException(status_code=404, detail="No encounters found")
 
-    transcript_html = ""
-    for turn in transcript:
-        role = html_escape(turn.get("role"))
-        text = html_escape(turn.get("text"))
-        transcript_html += f"<p><strong>{role}:</strong> {text}</p>"
+    selected_bundle = None
+    if packet_id:
+        for enc in encounters:
+            if safe_str(enc.get("packet_id")) == safe_str(packet_id):
+                selected_bundle = enc
+                break
+    if not selected_bundle:
+        selected_bundle = encounters[0]
 
-    if not transcript_html:
-        transcript_html = "<p>No call transcript available for this packet.</p>"
+    selected_packet_id = safe_str(selected_bundle.get("packet_id"))
+    selected_packet = selected_bundle.get("packet") or {}
+    selected_meta = selected_bundle.get("meta") or {}
+    selected_note = safe_str(selected_packet.get("note_text"))
+    selected_signed_note = signed_note_text(selected_note, selected_meta)
+    selected_spoken_summary = safe_str(selected_bundle.get("spoken_summary"))
 
-    patient_ctx = bundle.get("patient_ctx") or {}
-    chart_number = safe_str(patient_ctx.get("chart_number"))
-    back_url = f"/patient/{chart_number}?packet_id={html_escape(bundle['packet_id'])}&tab=encounters" if chart_number else "/"
+    encounter_tab_links = []
+    for enc in encounters:
+        enc_ctx = enc.get("patient_ctx") or {}
+        label = extract_encounter_label(
+            safe_str((enc.get("packet") or {}).get("note_text")),
+            safe_str(enc_ctx.get("chief_complaint")),
+        )
+        started = encounter_when(safe_str(enc_ctx.get("encounter_started_at")) or safe_str(enc.get("created_at")))
+        active_class = "enc-link active" if safe_str(enc.get("packet_id")) == selected_packet_id else "enc-link"
+        encounter_tab_links.append(
+            f"<li><a class='{active_class}' href='/patient/{html_escape(chart_number)}?packet_id={html_escape(enc['packet_id'])}&tab=encounters'>{html_escape(label)} — {html_escape(started)}</a></li>"
+        )
+    encounter_tab_html = "<ul>" + "".join(encounter_tab_links) + "</ul>"
+
+    allergies_html = render_list_items(
+        patient_ctx.get("allergies") or [],
+        ["allergen", "reaction", "severity"],
+        "No allergy data on file.",
+    )
+    conditions_html = render_structured_pmh(patient_ctx.get("conditions") or [])
+    social_html = render_list_items(
+        patient_ctx.get("social_history") or [],
+        ["domain", "value_text"],
+        "No social history on file.",
+    )
+    pharmacy_html = render_pharmacy(patient_ctx.get("preferred_pharmacy"))
+
+
+    demographics_panel = physician_demographics_form_html(
+        chart_number,
+        selected_packet_id,
+    )
+
+    pmh_panel = physician_patient_style_history_html(chart_number, selected_packet_id)
+    social_panel = f"""
+      <div class="card">
+        <h2 class="section-title">Past Social History</h2>
+        {social_html}
+      </div>
+    """
+
+    note_editor_html = (
+        f"""
+        <form method="post" action="/packet/{html_escape(selected_packet_id)}/update-note">
+          <input type="hidden" id="current_packet_id" value="{html_escape(selected_packet_id)}" />
+          <textarea id="note_text_editor" name="note_text">{html_escape(selected_note)}</textarea>
+          <p class="btnbar"><button type="submit">Save Note Changes</button></p>
+        </form>
+        """
+        if not selected_meta.get("signed")
+        else f"""
+        <input type="hidden" id="current_packet_id" value="{html_escape(selected_packet_id)}" />
+        <div class="readonly">{html_escape(selected_signed_note)}</div>
+        <p><em>Signed notes are read-only.</em></p>
+        """
+    )
+
+    addenda_html = ""
+    addenda = selected_meta.get("addenda") or []
+    if addenda:
+        addenda_html += "<div class='card'><h2 class='section-title'>Signed Addenda</h2>"
+        for idx, add in enumerate(addenda, 1):
+            addenda_html += f"<div class='readonly' style='margin-bottom:12px;'><strong>Addendum {idx}</strong>\n\n{html_escape(addendum_block(add))}</div>"
+        addenda_html += "</div>"
+
+    addendum_editor_html = (
+        f"""
+        <div class="card">
+          <h2 class="section-title">Add Addendum</h2>
+          <form method="post" action="/packet/{html_escape(selected_packet_id)}/addendum">
+            <textarea name="addendum_text" style="min-height:180px;"></textarea>
+            <p class="btnbar"><button type="submit">Sign Addendum</button></p>
+          </form>
+        </div>
+        """
+        if selected_meta.get("signed")
+        else ""
+    )
+
+    summary_editor = (
+        f"""
+        <form method="post" action="/packet/{html_escape(selected_packet_id)}/update-spoken-summary-comments">
+          <textarea id="spoken_summary_comments_editor" name="spoken_summary_comments" style="min-height:180px;">{html_escape(selected_meta.get("spoken_summary_comments"))}</textarea>
+          <p class="btnbar"><button type="submit">Save Spoken Summary Comments</button></p>
+        </form>
+        """
+        if not selected_meta.get("signed")
+        else f"""
+        <div class="readonly">{html_escape(selected_meta.get("spoken_summary_comments") or "No physician comments on spoken summary.")}</div>
+        <p><em>Signed notes lock spoken-summary comments. Use an addendum for later changes.</em></p>
+        """
+    )
+
+    physician_actions = f"""
+      <div class="card">
+        <h2 class="section-title">Physician Actions</h2>
+        <div class="btnbar">
+          {'' if selected_meta.get("signed") else f'<form method="post" action="/packet/{html_escape(selected_packet_id)}/sign"><button type="submit">Sign Note</button></form>'}
+          <form method="post" action="/packet/{html_escape(selected_packet_id)}/prescribe">
+            <button type="submit">Send Prescription</button>
+          </form>
+          <form method="post" action="/packet/{html_escape(selected_packet_id)}/note-sent/to-be-mailed">
+            <button type="submit">Mark Note To Be Mailed</button>
+          </form>
+        </div>
+      </div>
+    """
+
+    encounter_panel = f"""
+      <div class="card">
+        <h2 class="section-title">{html_escape(patient_ctx.get('patient_name'))}</h2>
+
+        <div class="meta-grid">
+          <div class="metric"><div class="label">Chart #</div><div class="value">{html_escape(patient_ctx.get('chart_number'))}</div></div>
+          <div class="metric"><div class="label">Date of Birth</div><div class="value">{html_escape(patient_ctx.get('date_of_birth'))}</div></div>
+          <div class="metric"><div class="label">Sex at Birth</div><div class="value">{html_escape(patient_ctx.get('sex_at_birth'))}</div></div>
+          <div class="metric"><div class="label">Chief Complaint</div><div class="value">{html_escape((selected_bundle.get('patient_ctx') or {}).get('chief_complaint'))}</div></div>
+          <div class="metric"><div class="label">Encounter Started</div><div class="value">{html_escape(format_portal_time((selected_bundle.get('patient_ctx') or {}).get('encounter_started_at') or selected_bundle.get('created_at')))}</div></div>
+          <div class="metric"><div class="label">Status</div><div class="value">{html_escape(selected_meta.get('status'))}</div></div>
+        </div>
+
+        <p class="pill">Prescription: {html_escape(selected_meta.get('prescription_status'))}</p>
+        <p class="pill">Delivery: {html_escape(selected_meta.get('note_sent'))}</p>
+      </div>
+
+      <div class="card">
+        <h2 class="section-title">Clinical Note</h2>
+        {note_editor_html}
+      </div>
+
+      <div class="card">
+        <h2 class="section-title">Spoken Summary to Patient</h2>
+        <div class="readonly">{html_escape(selected_spoken_summary or 'No spoken summary available.')}</div>
+
+        <h3 style="margin-top:18px;">Physician's Comments on Spoken Summary</h3>
+        {summary_editor}
+      </div>
+
+      {addenda_html}
+      {addendum_editor_html}
+      {physician_actions}
+    """
+
+    panel_html = {
+        "demographics": demographics_panel,
+        "pmh": pmh_panel,
+        "social": social_panel,
+        "encounters": encounter_panel,
+    }.get(tab, encounter_panel)
+
+    def tab_link(tab_name: str, label: str) -> str:
+        active = "tab active" if tab == tab_name else "tab"
+        return (
+            f"<a class='{active}' href='/patient/{html_escape(chart_number)}?packet_id={html_escape(selected_packet_id)}&tab={html_escape(tab_name)}'>{html_escape(label)}</a>"
+        )
 
     return shell(
-        f"Full Transcript {packet_id}",
+        f"{safe_str(patient_ctx.get('patient_name'))} - CallCare Physician Portal",
         f"""
         <div class="hero">
-          <h1>Full Transcript</h1>
-          <p>Packet {html_escape(packet_id)}</p>
+          <h1>{html_escape(patient_ctx.get('patient_name'))}</h1>
+          <p>Chart #{html_escape(patient_ctx.get('chart_number'))} · Physician review workspace</p>
         </div>
-        <p><a href="{back_url}">← Back to encounter</a></p>
-        <div class="card">{transcript_html}</div>
+
+        <p><a href="/">← Back to patient list</a> | <a href="/logout">Log out</a></p>
+
+        <div class="tabs">
+          {tab_link("demographics", "Demographics & Pharmacy")}
+          {tab_link("pmh", "Medical History")}
+          {tab_link("social", "Social History")}
+          {tab_link("encounters", "Encounters")}
+        </div>
+
+        <div class="layout">
+          <div class="card sidebar">
+            <h3 style="margin-top:0;">Encounters</h3>
+            {encounter_tab_html}
+          </div>
+          <div class="grid">
+            {panel_html}
+          </div>
+        </div>
         """,
     )
 
@@ -1745,135 +2205,114 @@ async def full_text(packet_id: str, request: Request) -> str:
 @app.post("/packet/{packet_id}/update-note")
 async def update_note(packet_id: str, request: Request, note_text: str = Form(...)) -> RedirectResponse:
     require_session(request)
-    path = packet_path(packet_id)
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Packet not found")
 
-    meta = load_meta(packet_id)
-    if meta.get("signed"):
+    row = query_one("SELECT chart_number, signed FROM callcare.portal_packets WHERE packet_id = %s LIMIT 1;", (packet_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="Packet not found")
+    if row.get("signed"):
         raise HTTPException(status_code=400, detail="Signed notes are read-only")
 
-    data = load_json(path)
-    data["note_text"] = safe_str(note_text)
-    save_json(path, data)
-
-    bundle = packet_bundle(path)
-    if bundle:
-        _sync_bundle_to_shared_db(bundle)
-        _queue_or_send_new_note_email_resend(packet_id, bundle.get("patient_ctx") or {})
-
-    chart_number = safe_str((bundle.get("patient_ctx") or {}).get("chart_number")) if bundle else ""
+    chart_number = safe_str(row.get("chart_number"))
+    execute(
+        "UPDATE callcare.portal_packets SET note_text = %s, updated_at = now() WHERE packet_id = %s;",
+        (safe_str(note_text), packet_id),
+    )
     return RedirectResponse(url=f"/patient/{chart_number}?packet_id={packet_id}&tab=encounters", status_code=303)
 
 
 @app.post("/packet/{packet_id}/update-spoken-summary-comments")
-async def update_spoken_summary_comments(
-    packet_id: str,
-    request: Request,
-    spoken_summary_comments: str = Form(...),
-) -> RedirectResponse:
+async def update_summary_comments(packet_id: str, request: Request, spoken_summary_comments: str = Form(...)) -> RedirectResponse:
     require_session(request)
-    path = packet_path(packet_id)
-    if not path.exists():
+
+    row = query_one("SELECT chart_number, signed FROM callcare.portal_packets WHERE packet_id = %s LIMIT 1;", (packet_id,))
+    if not row:
         raise HTTPException(status_code=404, detail="Packet not found")
+    if row.get("signed"):
+        raise HTTPException(status_code=400, detail="Signed notes lock spoken-summary comments")
 
-    meta = load_meta(packet_id)
-    meta["spoken_summary_comments"] = safe_str(spoken_summary_comments)
-    save_meta(packet_id, meta)
-
-    bundle = packet_bundle(path)
-    if bundle:
-        _sync_bundle_to_shared_db(bundle)
-        _queue_or_send_new_note_email_resend(packet_id, bundle.get("patient_ctx") or {})
-
-    chart_number = safe_str((bundle.get("patient_ctx") or {}).get("chart_number")) if bundle else ""
+    chart_number = safe_str(row.get("chart_number"))
+    execute(
+        "UPDATE callcare.portal_packets SET spoken_summary_comments = %s, updated_at = now() WHERE packet_id = %s;",
+        (safe_str(spoken_summary_comments), packet_id),
+    )
     return RedirectResponse(url=f"/patient/{chart_number}?packet_id={packet_id}&tab=encounters", status_code=303)
 
 
 @app.post("/packet/{packet_id}/sign")
 async def sign_note(packet_id: str, request: Request) -> RedirectResponse:
     require_session(request)
-    path = packet_path(packet_id)
-    if not path.exists():
+
+    row = query_one("SELECT chart_number FROM callcare.portal_packets WHERE packet_id = %s LIMIT 1;", (packet_id,))
+    if not row:
         raise HTTPException(status_code=404, detail="Packet not found")
 
-    save_note_signed(packet_id)
-
-    bundle = packet_bundle(path)
-    if bundle:
-        _sync_bundle_to_shared_db(bundle)
-        _queue_or_send_new_note_email_resend(packet_id, bundle.get("patient_ctx") or {}, reason="note_ready")
-
-    chart_number = safe_str((bundle.get("patient_ctx") or {}).get("chart_number")) if bundle else ""
+    chart_number = safe_str(row.get("chart_number"))
+    execute(
+        "UPDATE callcare.portal_packets SET signed = true, signed_at = now(), signed_by = 'Kelly Kruk, DO | GA License #: 83704 | NPI: 1285682435', status = 'completed', updated_at = now() WHERE packet_id = %s;",
+        (packet_id,),
+    )
+    patient_ctx = get_patient_context(chart_number) or {}
+    queue_or_send_new_note_email(packet_id, patient_ctx, reason="note_ready")
     return RedirectResponse(url=f"/patient/{chart_number}?packet_id={packet_id}&tab=encounters", status_code=303)
 
 
 @app.post("/packet/{packet_id}/addendum")
-async def sign_addendum(packet_id: str, request: Request, addendum_text: str = Form(...)) -> RedirectResponse:
+async def sign_addendum_route(packet_id: str, request: Request, addendum_text: str = Form(...)) -> RedirectResponse:
     require_session(request)
-    path = packet_path(packet_id)
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Packet not found")
 
-    meta = load_meta(packet_id)
-    if not meta.get("signed"):
+    row = query_one("SELECT chart_number, signed, COALESCE(addenda, '[]'::jsonb) AS addenda FROM callcare.portal_packets WHERE packet_id = %s LIMIT 1;", (packet_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="Packet not found")
+    if not row.get("signed"):
         raise HTTPException(status_code=400, detail="Note must be signed before addenda can be added")
     if not safe_str(addendum_text):
         raise HTTPException(status_code=400, detail="Addendum text is required")
 
-    add_signed_addendum(packet_id, addendum_text)
-
-    bundle = packet_bundle(path)
-    if bundle:
-        _sync_bundle_to_shared_db(bundle)
-        _queue_or_send_new_note_email_resend(packet_id, bundle.get("patient_ctx") or {}, reason="addendum")
-
-    chart_number = safe_str((bundle.get("patient_ctx") or {}).get("chart_number")) if bundle else ""
+    chart_number = safe_str(row.get("chart_number"))
+    addenda = row.get("addenda") or []
+    addenda.append(
+        {
+            "text": safe_str(addendum_text),
+            "signed_at": now_iso(),
+            "signed_by": "Kelly Kruk, DO | GA License #: 83704 | NPI: 1285682435",
+        }
+    )
+    execute(
+        "UPDATE callcare.portal_packets SET addenda = %s::jsonb, updated_at = now() WHERE packet_id = %s;",
+        (json.dumps(addenda), packet_id),
+    )
+    patient_ctx = get_patient_context(chart_number) or {}
+    queue_or_send_new_note_email(packet_id, patient_ctx, reason="addendum")
     return RedirectResponse(url=f"/patient/{chart_number}?packet_id={packet_id}&tab=encounters", status_code=303)
 
 
 @app.post("/packet/{packet_id}/prescribe")
-async def send_prescription(packet_id: str, request: Request) -> RedirectResponse:
+async def prescribe(packet_id: str, request: Request) -> RedirectResponse:
     require_session(request)
-    path = packet_path(packet_id)
-    if not path.exists():
+
+    row = query_one("SELECT chart_number FROM callcare.portal_packets WHERE packet_id = %s LIMIT 1;", (packet_id,))
+    if not row:
         raise HTTPException(status_code=404, detail="Packet not found")
 
-    meta = load_meta(packet_id)
-    meta["prescription_status"] = "sent"
-    save_meta(packet_id, meta)
-
-    bundle = packet_bundle(path)
-    if bundle:
-        _sync_bundle_to_shared_db(bundle)
-        _queue_or_send_new_note_email_resend(packet_id, bundle.get("patient_ctx") or {})
-
-    chart_number = safe_str((bundle.get("patient_ctx") or {}).get("chart_number")) if bundle else ""
+    chart_number = safe_str(row.get("chart_number"))
+    execute(
+        "UPDATE callcare.portal_packets SET prescription_status = 'sent', updated_at = now() WHERE packet_id = %s;",
+        (packet_id,),
+    )
     return RedirectResponse(url=f"/patient/{chart_number}?packet_id={packet_id}&tab=encounters", status_code=303)
 
 
-@app.post("/packet/{packet_id}/note-sent/{mode}")
-async def note_sent(packet_id: str, mode: str, request: Request) -> RedirectResponse:
+@app.post("/packet/{packet_id}/note-sent/to-be-mailed")
+async def note_to_be_mailed(packet_id: str, request: Request) -> RedirectResponse:
     require_session(request)
-    path = packet_path(packet_id)
-    if not path.exists():
+
+    row = query_one("SELECT chart_number FROM callcare.portal_packets WHERE packet_id = %s LIMIT 1;", (packet_id,))
+    if not row:
         raise HTTPException(status_code=404, detail="Packet not found")
 
-    normalized = safe_str(mode).lower()
-    if normalized not in {"emailed", "to-be-mailed", "to_be_mailed", "to be mailed"}:
-        raise HTTPException(status_code=400, detail="Invalid note-sent mode")
-
-    meta = load_meta(packet_id)
-    bundle = packet_bundle(path)
-
-    if normalized == "emailed":
-        result = _queue_or_send_new_note_email_resend(packet_id, (bundle or {}).get("patient_ctx") or {})
-        meta["note_sent"] = "emailed"
-        meta["email_last_queued_at"] = safe_str(result.get("queued_at"))
-    else:
-        meta["note_sent"] = "to be mailed"
-
-    save_meta(packet_id, meta)
-
-    chart_number = safe_str(((bundle or {}).get("patient_ctx") or {}).get("chart_number"))
+    chart_number = safe_str(row.get("chart_number"))
+    execute(
+        "UPDATE callcare.portal_packets SET note_sent = 'to be mailed', updated_at = now() WHERE packet_id = %s;",
+        (packet_id,),
+    )
     return RedirectResponse(url=f"/patient/{chart_number}?packet_id={packet_id}&tab=encounters", status_code=303)
