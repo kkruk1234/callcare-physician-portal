@@ -1170,10 +1170,27 @@ def physician_demographics_bundle(chart_number: str) -> dict:
 
             pharmacy = dict(cur.fetchone() or {})
 
+            cur.execute(
+                """
+                SELECT
+                  height_feet,
+                  height_inches,
+                  weight_lbs
+                FROM callcare.patient_vitals
+                WHERE patient_id = %s::uuid
+                ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+                LIMIT 1
+                """,
+                (patient_id,),
+            )
+
+            vitals = dict(cur.fetchone() or {})
+
     return {
         "patient": patient,
         "address": address,
         "pharmacy": pharmacy,
+        "vitals": vitals,
     }
 
 
@@ -1187,6 +1204,7 @@ def physician_demographics_form_html(
     patient = bundle.get("patient") or {}
     address = bundle.get("address") or {}
     pharmacy = bundle.get("pharmacy") or {}
+    vitals = bundle.get("vitals") or {}
 
     return f"""
     <form method="post"
@@ -1269,6 +1287,32 @@ def physician_demographics_form_html(
             <label>ZIP Code</label>
             <input name="postal_code"
                    value="{html_escape(address.get('postal_code'))}" />
+          </div>
+
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:20px;">
+        <h2 class="section-title">Height & Weight</h2>
+
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:18px;">
+
+          <div>
+            <label>Height Feet</label>
+            <input name="height_feet"
+                   value="{html_escape(vitals.get('height_feet'))}" />
+          </div>
+
+          <div>
+            <label>Height Inches</label>
+            <input name="height_inches"
+                   value="{html_escape(vitals.get('height_inches'))}" />
+          </div>
+
+          <div>
+            <label>Weight Pounds</label>
+            <input name="weight_lbs"
+                   value="{html_escape(vitals.get('weight_lbs'))}" />
           </div>
 
         </div>
