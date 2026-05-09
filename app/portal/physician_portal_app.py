@@ -1095,6 +1095,233 @@ def physician_allergy_rows_from_db(chart_number: str):
             return [dict(r) for r in cur.fetchall()]
 
 
+
+def physician_demographics_bundle(chart_number: str) -> dict:
+    if not CALLCARE_SHARED_DATABASE_URL:
+        return {}
+
+    with psycopg.connect(CALLCARE_SHARED_DATABASE_URL, row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+
+            cur.execute(
+                """
+                SELECT
+                  p.id::text AS patient_id,
+                  p.legal_first_name,
+                  p.legal_last_name,
+                  p.preferred_name,
+                  p.date_of_birth::text AS date_of_birth,
+                  p.sex_at_birth,
+                  p.gender_identity,
+                  p.phone_number,
+                  p.email
+                FROM callcare.patients p
+                WHERE p.chart_number = %s
+                  AND p.archived_at IS NULL
+                LIMIT 1
+                """,
+                (chart_number,),
+            )
+
+            patient = dict(cur.fetchone() or {})
+
+            patient_id = patient.get("patient_id")
+            if not patient_id:
+                return {}
+
+            cur.execute(
+                """
+                SELECT
+                  address_line_1,
+                  address_line_2,
+                  city,
+                  state,
+                  postal_code,
+                  county_name
+                FROM callcare.patient_addresses
+                WHERE patient_id = %s::uuid
+                ORDER BY updated_at DESC NULLS LAST
+                LIMIT 1
+                """,
+                (patient_id,),
+            )
+
+            address = dict(cur.fetchone() or {})
+
+            cur.execute(
+                """
+                SELECT
+                  ph.name,
+                  ph.address_line_1,
+                  ph.city,
+                  ph.state,
+                  ph.postal_code,
+                  ph.phone,
+                  ph.fax
+                FROM callcare.patient_pharmacies pp
+                JOIN callcare.pharmacies ph
+                  ON ph.id = pp.pharmacy_id
+                WHERE pp.patient_id = %s::uuid
+                  AND pp.is_preferred = true
+                LIMIT 1
+                """,
+                (patient_id,),
+            )
+
+            pharmacy = dict(cur.fetchone() or {})
+
+    return {
+        "patient": patient,
+        "address": address,
+        "pharmacy": pharmacy,
+    }
+
+
+def physician_demographics_form_html(
+    chart_number: str,
+    selected_packet_id: str,
+) -> str:
+
+    bundle = physician_demographics_bundle(chart_number)
+
+    patient = bundle.get("patient") or {}
+    address = bundle.get("address") or {}
+    pharmacy = bundle.get("pharmacy") or {}
+
+    return f"""
+    <form method="post"
+          action="/patient/{html_escape(chart_number)}/demographics?packet_id={html_escape(selected_packet_id)}"
+          autocomplete="off">
+
+      <div class="card">
+        <h2 class="section-title">Background</h2>
+
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:18px;">
+
+          <div>
+            <label>Preferred Name</label>
+            <input name="preferred_name"
+                   value="{html_escape(patient.get('preferred_name'))}" />
+          </div>
+
+          <div>
+            <label>Phone Number</label>
+            <input name="phone_number"
+                   value="{html_escape(patient.get('phone_number'))}" />
+          </div>
+
+          <div>
+            <label>Email</label>
+            <input name="email"
+                   value="{html_escape(patient.get('email'))}" />
+          </div>
+
+          <div>
+            <label>Sex Assigned at Birth</label>
+            <select name="sex_at_birth"
+                    style="width:100%;padding:12px;border-radius:12px;border:1px solid #ccc;background:white;">
+              <option value="">Select</option>
+              <option value="female" {"selected" if safe_str(patient.get('sex_at_birth')).lower() == "female" else ""}>Female</option>
+              <option value="male" {"selected" if safe_str(patient.get('sex_at_birth')).lower() == "male" else ""}>Male</option>
+              <option value="intersex" {"selected" if safe_str(patient.get('sex_at_birth')).lower() == "intersex" else ""}>Intersex</option>
+            </select>
+          </div>
+
+          <div>
+            <label>Gender Identity</label>
+            <input name="gender_identity"
+                   value="{html_escape(patient.get('gender_identity'))}" />
+          </div>
+
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:20px;">
+        <h2 class="section-title">Address</h2>
+
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:18px;">
+
+          <div>
+            <label>Address</label>
+            <input name="address_line_1"
+                   value="{html_escape(address.get('address_line_1'))}" />
+          </div>
+
+          <div>
+            <label>Apartment / Unit</label>
+            <input name="address_line_2"
+                   value="{html_escape(address.get('address_line_2'))}" />
+          </div>
+
+          <div>
+            <label>City</label>
+            <input name="city"
+                   value="{html_escape(address.get('city'))}" />
+          </div>
+
+          <div>
+            <label>State</label>
+            <input name="state"
+                   value="{html_escape(address.get('state'))}" />
+          </div>
+
+          <div>
+            <label>ZIP Code</label>
+            <input name="postal_code"
+                   value="{html_escape(address.get('postal_code'))}" />
+          </div>
+
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:20px;">
+        <h2 class="section-title">Preferred Pharmacy</h2>
+
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:18px;">
+
+          <div>
+            <label>Pharmacy Name</label>
+            <input name="pharmacy_name"
+                   value="{html_escape(pharmacy.get('name'))}" />
+          </div>
+
+          <div>
+            <label>Pharmacy Address</label>
+            <input name="pharmacy_address_line_1"
+                   value="{html_escape(pharmacy.get('address_line_1'))}" />
+          </div>
+
+          <div>
+            <label>Pharmacy City</label>
+            <input name="pharmacy_city"
+                   value="{html_escape(pharmacy.get('city'))}" />
+          </div>
+
+          <div>
+            <label>Pharmacy State</label>
+            <input name="pharmacy_state"
+                   value="{html_escape(pharmacy.get('state'))}" />
+          </div>
+
+          <div>
+            <label>Pharmacy ZIP Code</label>
+            <input name="pharmacy_postal_code"
+                   value="{html_escape(pharmacy.get('postal_code'))}" />
+          </div>
+
+        </div>
+
+        <div style="margin-top:18px;">
+          <button type="submit"
+                  style="font-size:16px;padding:12px 18px;border-radius:18px;font-weight:800;">
+            Save Demographics & Pharmacy
+          </button>
+        </div>
+      </div>
+    </form>
+    """
+
+
 def physician_patient_style_history_html(chart_number: str, selected_packet_id: str) -> str:
     conditions = physician_history_rows_from_db(chart_number)
     allergies = physician_allergy_rows_from_db(chart_number)
@@ -1228,7 +1455,7 @@ def physician_patient_style_history_html(chart_number: str, selected_packet_id: 
         <h2 class="section-title">Other Conditions</h2>
         <textarea
           name="other_conditions"
-          rows="10"
+          rows="8"
           style="width:100%;padding:12px;border-radius:12px;border:1px solid #ccc;font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;font-size:15px;"
           placeholder="Enter any additional diagnoses or medical conditions here."
         >{html_escape(chr(10).join(other_lines))}</textarea>
@@ -1549,23 +1776,11 @@ async def patient_chart(
     )
     pharmacy_html = render_pharmacy(patient_ctx.get("preferred_pharmacy"))
 
-    demographics_panel = f"""
-      <div class="card">
-        <h2 class="section-title">Demographics</h2>
-        <div class="meta-grid">
-          <div class="metric"><div class="label">Patient</div><div class="value">{html_escape(patient_ctx.get('patient_name'))}</div></div>
-          <div class="metric"><div class="label">Chart #</div><div class="value">{html_escape(patient_ctx.get('chart_number'))}</div></div>
-          <div class="metric"><div class="label">Date of Birth</div><div class="value">{html_escape(patient_ctx.get('date_of_birth'))}</div></div>
-          <div class="metric"><div class="label">Sex at Birth</div><div class="value">{html_escape(patient_ctx.get('sex_at_birth'))}</div></div>
-          <div class="metric"><div class="label">Phone</div><div class="value">{html_escape(patient_ctx.get('phone_number'))}</div></div>
-          <div class="metric"><div class="label">Email</div><div class="value">{html_escape(patient_ctx.get('email'))}</div></div>
-        </div>
-      </div>
-      <div class="card">
-        <h2 class="section-title">Preferred Pharmacy</h2>
-        {pharmacy_html}
-      </div>
-    """
+
+    demographics_panel = physician_demographics_form_html(
+        chart_number,
+        selected_packet_id,
+    )
 
     pmh_panel = physician_patient_style_history_html(chart_number, selected_packet_id)
     social_panel = f"""
