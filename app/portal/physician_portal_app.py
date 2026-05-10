@@ -832,8 +832,10 @@ async def home(request: Request) -> str:
         patient_ctx = latest["patient_ctx"] or {}
         packet = latest["packet"] or {}
         meta = latest["meta"] or {}
-        label = extract_encounter_label(
-            safe_str(packet.get("note_text")),
+        label = derive_chief_complaint_label(
+            safe_str((enc.get("packet") or {}).get("note_text")),
+            safe_str(enc_ctx.get("chief_complaint")),
+        )note_text")),
             safe_str(patient_ctx.get("chief_complaint")),
         )
         rows.append(
@@ -2496,6 +2498,39 @@ async def save_physician_medications(
     return RedirectResponse(url=f"/patient/{chart_number}?packet_id={packet_id}&tab=medications", status_code=303)
 
 
+
+def derive_chief_complaint_label(note_text: str, stored_chief_complaint: str = "") -> str:
+    stored = safe_str(stored_chief_complaint).strip()
+    if stored:
+        return stored
+
+    text = safe_str(note_text)
+    lower = text.lower()
+
+    marker = "the working diagnosis is "
+    likely_marker = " likely"
+    start = lower.find(marker)
+    if start != -1:
+        start += len(marker)
+        end = lower.find(likely_marker, start)
+        if end != -1:
+            diagnosis = text[start:end].strip(" .:-")
+            if diagnosis:
+                return diagnosis[:1].upper() + diagnosis[1:]
+
+    diff_marker = "differential:"
+    diff_start = lower.find(diff_marker)
+    if diff_start != -1:
+        tail = text[diff_start + len(diff_marker):]
+        for line in tail.splitlines():
+            clean = safe_str(line).strip()
+            clean = re.sub(r"^\d+[\).\:\-]\s*", "", clean).strip()
+            if clean:
+                return "Possible " + clean[:1].lower() + clean[1:]
+
+    return "Encounter"
+
+
 @app.get("/patient/{chart_number}", response_class=HTMLResponse)
 async def patient_chart(
     chart_number: str,
@@ -2526,6 +2561,10 @@ async def patient_chart(
     selected_packet = selected_bundle.get("packet") or {}
     selected_meta = selected_bundle.get("meta") or {}
     selected_note = safe_str(selected_packet.get("note_text"))
+    selected_chief_complaint_label = derive_chief_complaint_label(
+        selected_note,
+        safe_str((selected_bundle.get("patient_ctx") or {}).get("chief_complaint")),
+    )
     selected_signed_note = signed_note_text(selected_note, selected_meta)
     selected_spoken_summary = safe_str(selected_bundle.get("spoken_summary"))
 
@@ -2641,7 +2680,7 @@ async def patient_chart(
           <div class="metric"><div class="label">Chart #</div><div class="value">{html_escape(patient_ctx.get('chart_number'))}</div></div>
           <div class="metric"><div class="label">Date of Birth</div><div class="value">{html_escape(patient_ctx.get('date_of_birth'))}</div></div>
           <div class="metric"><div class="label">Sex at Birth</div><div class="value">{html_escape(patient_ctx.get('sex_at_birth'))}</div></div>
-          <div class="metric"><div class="label">Chief Complaint</div><div class="value">{html_escape((selected_bundle.get('patient_ctx') or {}).get('chief_complaint'))}</div></div>
+          <div class="metric"><div class="label">Chief Complaint</div><div class="value">{html_escape(selected_chief_complaint_label)}</div></div>
           <div class="metric"><div class="label">Encounter Started</div><div class="value">{html_escape(format_portal_time((selected_bundle.get('patient_ctx') or {}).get('encounter_started_at') or selected_bundle.get('created_at')))}</div></div>
           <div class="metric"><div class="label">Status</div><div class="value">{html_escape(selected_meta.get('status'))}</div></div>
         </div>
@@ -2657,7 +2696,7 @@ async def patient_chart(
           <form method="post" action="/packet/{html_escape(selected_packet_id)}/update-note">
             <div style="margin-bottom:16px;">
               <label>Chief Complaint</label>
-              <input name="chief_complaint" value="{html_escape((selected_bundle.get('patient_ctx') or {}).get('chief_complaint'))}" />
+              <input name="chief_complaint" value="{html_escape(selected_chief_complaint_label)}" />
             </div>
             <textarea id="note_text_editor" name="note_text">{html_escape(selected_note)}</textarea>
             <p class="btnbar"><button type="submit">Save Note Changes</button></p>
