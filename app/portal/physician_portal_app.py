@@ -2618,6 +2618,21 @@ async def patient_chart(
         """
     )
 
+    clinical_note_panel = (
+        f"""
+        <form method="post" action="/packet/{html_escape(selected_packet_id)}/update-note">
+          <div style="margin-bottom:16px;">
+            <label>Chief Complaint</label>
+            <input name="chief_complaint" value="{html_escape((selected_bundle.get('patient_ctx') or {}).get('chief_complaint'))}" />
+          </div>
+          <textarea id="note_text_editor" name="note_text">{html_escape(selected_note)}</textarea>
+          <p class="btnbar"><button type="submit">Save Note Changes</button></p>
+        </form>
+        """
+        if not selected_meta.get("signed")
+        else note_editor_html
+    )
+
     physician_actions = f"""
       <div class="card">
         <h2 class="section-title">Physician Actions</h2>
@@ -2652,20 +2667,7 @@ async def patient_chart(
 
       <div class="card">
         <h2 class="section-title">Clinical Note</h2>
-        {(
-          f"""
-          <form method="post" action="/packet/{html_escape(selected_packet_id)}/update-note">
-            <div style="margin-bottom:16px;">
-              <label>Chief Complaint</label>
-              <input name="chief_complaint" value="{html_escape((selected_bundle.get('patient_ctx') or {}).get('chief_complaint'))}" />
-            </div>
-            <textarea id="note_text_editor" name="note_text">{html_escape(selected_note)}</textarea>
-            <p class="btnbar"><button type="submit">Save Note Changes</button></p>
-          </form>
-          """
-          if not selected_meta.get("signed")
-          else note_editor_html
-        )}
+        {clinical_note_panel}
       </div>
 
       <div class="card">
