@@ -2652,7 +2652,20 @@ async def patient_chart(
 
       <div class="card">
         <h2 class="section-title">Clinical Note</h2>
-        {note_editor_html}
+        {(
+          f"""
+          <form method="post" action="/packet/{html_escape(selected_packet_id)}/update-note">
+            <div style="margin-bottom:16px;">
+              <label>Chief Complaint</label>
+              <input name="chief_complaint" value="{html_escape((selected_bundle.get('patient_ctx') or {}).get('chief_complaint'))}" />
+            </div>
+            <textarea id="note_text_editor" name="note_text">{html_escape(selected_note)}</textarea>
+            <p class="btnbar"><button type="submit">Save Note Changes</button></p>
+          </form>
+          """
+          if not selected_meta.get("signed")
+          else note_editor_html
+        )}
       </div>
 
       <div class="card">
@@ -2725,8 +2738,15 @@ async def update_note(packet_id: str, request: Request, note_text: str = Form(..
 
     chart_number = safe_str(row.get("chart_number"))
     execute(
-        "UPDATE callcare.portal_packets SET note_text = %s, updated_at = now() WHERE packet_id = %s;",
-        (safe_str(note_text), packet_id),
+        """
+        UPDATE callcare.portal_packets
+        SET
+          note_text = %s,
+          chief_complaint = NULLIF(%s, ''),
+          updated_at = now()
+        WHERE packet_id = %s;
+        """,
+        (safe_str(note_text), safe_str(chief_complaint), packet_id),
     )
     return RedirectResponse(url=f"/patient/{chart_number}?packet_id={packet_id}&tab=encounters", status_code=303)
 
