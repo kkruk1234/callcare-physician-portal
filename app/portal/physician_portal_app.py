@@ -832,7 +832,7 @@ async def home(request: Request) -> str:
         patient_ctx = latest["patient_ctx"] or {}
         packet = latest["packet"] or {}
         meta = latest["meta"] or {}
-        label = physician_encounter_label(enc)
+        label = extract_encounter_label(enc)
         started = encounter_when(safe_str(enc_ctx.get("encounter_started_at")) or safe_str(enc.get("created_at")))
         active_class = "enc-link active" if safe_str(enc.get("packet_id")) == selected_packet_id else "enc-link"
         encounter_tab_links.append(
