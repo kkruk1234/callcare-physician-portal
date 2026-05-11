@@ -832,8 +832,14 @@ async def home(request: Request) -> str:
         patient_ctx = latest["patient_ctx"] or {}
         packet = latest["packet"] or {}
         meta = latest["meta"] or {}
-        label = extract_encounter_label(latest, safe_str(patient_ctx.get("chief_complaint")))
-        started = encounter_when(safe_str(enc_ctx.get("encounter_started_at")) or safe_str(enc.get("created_at")))
+        label = extract_encounter_label(
+            latest,
+            safe_str(patient_ctx.get("chief_complaint")),
+        )
+        started = encounter_when(
+            safe_str(patient_ctx.get("encounter_started_at")),
+            safe_str(latest.get("created_at")),
+        )
         active_class = "enc-link active" if safe_str(enc.get("packet_id")) == selected_packet_id else "enc-link"
         encounter_tab_links.append(
             f"<li><a class='{active_class}' href='/patient/{html_escape(chart_number)}?packet_id={html_escape(enc['packet_id'])}&tab=encounters'>{html_escape(label)} — {html_escape(started)}</a></li>"
