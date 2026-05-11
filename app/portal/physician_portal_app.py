@@ -829,202 +829,52 @@ async def home(request: Request) -> str:
     rows = []
     for g in groups:
         latest = g["encounters"][0]
-        patient_ctx = latest["patient_ctx"] or {}
-        packet = latest["packet"] or {}
-        meta = latest["meta"] or {}
+        patient_ctx = latest.get("patient_ctx") or {}
+        packet = latest.get("packet") or {}
+        meta = latest.get("meta") or {}
+
         label = extract_encounter_label(
-            latest,
+            safe_str(packet.get("note_text")),
             safe_str(patient_ctx.get("chief_complaint")),
         )
-        started = encounter_when(
-            safe_str(patient_ctx.get("encounter_started_at")) or safe_str(latest.get("created_at"))
-        )
-        active_class = "enc-link active" if safe_str(enc.get("packet_id")) == selected_packet_id else "enc-link"
-        encounter_tab_links.append(
-            f"<li><a class='{active_class}' href='/patient/{html_escape(chart_number)}?packet_id={html_escape(enc['packet_id'])}&tab=encounters'>{html_escape(label)} — {html_escape(started)}</a></li>"
-        )
-    encounter_tab_html = "<ul>" + "".join(encounter_tab_links) + "</ul>"
 
-    allergies_html = render_list_items(
-        patient_ctx.get("allergies") or [],
-        ["allergen", "reaction", "severity"],
-        "No allergy data on file.",
-    )
-    conditions_html = render_structured_pmh(patient_ctx.get("conditions") or [])
-    social_html = render_list_items(
-        patient_ctx.get("social_history") or [],
-        ["domain", "value_text"],
-        "No social history on file.",
-    )
-    pharmacy_html = render_pharmacy(patient_ctx.get("preferred_pharmacy"))
-
-
-    demographics_panel = physician_demographics_form_html(
-        chart_number,
-        selected_packet_id,
-    )
-
-    pmh_panel = physician_patient_style_history_html(chart_number, selected_packet_id)
-    social_panel = physician_social_form_html(chart_number, selected_packet_id)
-    medications_panel = physician_medications_form_html(chart_number, selected_packet_id)
-
-    note_editor_html = (
-        f"""
-        <form method="post" action="/packet/{html_escape(selected_packet_id)}/update-note">
-          <input type="hidden" id="current_packet_id" value="{html_escape(selected_packet_id)}" />
-          <textarea id="note_text_editor" name="note_text">{html_escape(selected_note)}</textarea>
-          <p class="btnbar"><button type="submit">Save Note Changes</button></p>
-        </form>
-        """
-        if not selected_meta.get("signed")
-        else f"""
-        <input type="hidden" id="current_packet_id" value="{html_escape(selected_packet_id)}" />
-        <div class="readonly">{html_escape(selected_signed_note)}</div>
-        <p><em>Signed notes are read-only.</em></p>
-        """
-    )
-
-    addenda_html = ""
-    addenda = selected_meta.get("addenda") or []
-    if addenda:
-        addenda_html += "<div class='card'><h2 class='section-title'>Signed Addenda</h2>"
-        for idx, add in enumerate(addenda, 1):
-            addenda_html += f"<div class='readonly' style='margin-bottom:12px;'><strong>Addendum {idx}</strong>\n\n{html_escape(addendum_block(add))}</div>"
-        addenda_html += "</div>"
-
-    addendum_editor_html = (
-        f"""
-        <div class="card">
-          <h2 class="section-title">Add Addendum</h2>
-          <form method="post" action="/packet/{html_escape(selected_packet_id)}/addendum">
-            <textarea name="addendum_text" style="min-height:180px;"></textarea>
-            <p class="btnbar"><button type="submit">Sign Addendum</button></p>
-          </form>
-        </div>
-        """
-        if selected_meta.get("signed")
-        else ""
-    )
-
-    summary_editor = (
-        f"""
-        <form method="post" action="/packet/{html_escape(selected_packet_id)}/update-spoken-summary-comments">
-          <textarea id="spoken_summary_comments_editor" name="spoken_summary_comments" style="min-height:180px;">{html_escape(selected_meta.get("spoken_summary_comments"))}</textarea>
-          <p class="btnbar"><button type="submit">Save Spoken Summary Comments</button></p>
-        </form>
-        """
-        if not selected_meta.get("signed")
-        else f"""
-        <div class="readonly">{html_escape(selected_meta.get("spoken_summary_comments") or "No physician comments on spoken summary.")}</div>
-        <p><em>Signed notes lock spoken-summary comments. Use an addendum for later changes.</em></p>
-        """
-    )
-
-    clinical_note_panel = (
-        f"""
-        <form method="post" action="/packet/{html_escape(selected_packet_id)}/update-note">
-          <div style="margin-bottom:16px;">
-            <label>Chief Complaint</label>
-            <input name="chief_complaint" value="{html_escape((selected_bundle.get('patient_ctx') or {}).get('chief_complaint'))}" />
-          </div>
-          <textarea id="note_text_editor" name="note_text">{html_escape(selected_note)}</textarea>
-          <p class="btnbar"><button type="submit">Save Note Changes</button></p>
-        </form>
-        """
-        if not selected_meta.get("signed")
-        else note_editor_html
-    )
-
-    physician_actions = f"""
-      <div class="card">
-        <h2 class="section-title">Physician Actions</h2>
-        <div class="btnbar">
-          {'' if selected_meta.get("signed") else f'<form method="post" action="/packet/{html_escape(selected_packet_id)}/sign"><button type="submit">Sign Note</button></form>'}
-          <form method="post" action="/packet/{html_escape(selected_packet_id)}/prescribe">
-            <button type="submit">Send Prescription</button>
-          </form>
-          <form method="post" action="/packet/{html_escape(selected_packet_id)}/note-sent/to-be-mailed">
-            <button type="submit">Mark Note To Be Mailed</button>
-          </form>
-        </div>
-      </div>
-    """
-
-    encounter_panel = f"""
-      <div class="card">
-        <h2 class="section-title">{html_escape(patient_ctx.get('patient_name'))}</h2>
-
-        <div class="meta-grid">
-          <div class="metric"><div class="label">Chart #</div><div class="value">{html_escape(patient_ctx.get('chart_number'))}</div></div>
-          <div class="metric"><div class="label">Date of Birth</div><div class="value">{html_escape(patient_ctx.get('date_of_birth'))}</div></div>
-          <div class="metric"><div class="label">Sex at Birth</div><div class="value">{html_escape(patient_ctx.get('sex_at_birth'))}</div></div>
-          <div class="metric"><div class="label">Chief Complaint</div><div class="value">{html_escape((selected_bundle.get('patient_ctx') or {}).get('chief_complaint'))}</div></div>
-          <div class="metric"><div class="label">Encounter Started</div><div class="value">{html_escape(format_portal_time((selected_bundle.get('patient_ctx') or {}).get('encounter_started_at') or selected_bundle.get('created_at')))}</div></div>
-          <div class="metric"><div class="label">Status</div><div class="value">{html_escape(selected_meta.get('status'))}</div></div>
-        </div>
-
-        <p class="pill">Prescription: {html_escape(selected_meta.get('prescription_status'))}</p>
-        <p class="pill">Delivery: {html_escape(selected_meta.get('note_sent'))}</p>
-      </div>
-
-      <div class="card">
-        <h2 class="section-title">Clinical Note</h2>
-        {clinical_note_panel}
-      </div>
-
-      <div class="card">
-        <h2 class="section-title">Spoken Summary to Patient</h2>
-        <div class="readonly">{html_escape(selected_spoken_summary or 'No spoken summary available.')}</div>
-
-        <h3 style="margin-top:18px;">Physician's Comments on Spoken Summary</h3>
-        {summary_editor}
-      </div>
-
-      {addenda_html}
-      {addendum_editor_html}
-      {physician_actions}
-    """
-
-    panel_html = {
-        "demographics": demographics_panel,
-        "pmh": pmh_panel,
-        "social": social_panel,
-        "medications": medications_panel,
-        "encounters": encounter_panel,
-    }.get(tab, encounter_panel)
-
-    def tab_link(tab_name: str, label: str) -> str:
-        active = "tab active" if tab == tab_name else "tab"
-        return (
-            f"<a class='{active}' href='/patient/{html_escape(chart_number)}?packet_id={html_escape(selected_packet_id)}&tab={html_escape(tab_name)}'>{html_escape(label)}</a>"
+        rows.append(
+            f"<tr>"
+            f"<td><a href='/patient/{html_escape(g['chart_number'])}'>{html_escape(g['patient_name'])}</a></td>"
+            f"<td>{html_escape(g['chart_number'])}</td>"
+            f"<td>{len(g['encounters'])}</td>"
+            f"<td>{html_escape(label)}</td>"
+            f"<td>{html_escape(safe_str(meta.get('status')))}</td>"
+            f"<td>{html_escape(safe_str(meta.get('prescription_status')))}</td>"
+            f"</tr>"
         )
 
     return shell(
-        f"{safe_str(patient_ctx.get('patient_name'))} - CallCare Physician Portal",
+        "CallCare Physician Portal",
         f"""
         <div class="hero">
-          <h1>{html_escape(patient_ctx.get('patient_name'))}</h1>
-          <p>Chart #{html_escape(patient_ctx.get('chart_number'))} · Physician review workspace</p>
+          <h1>CallCare Physician Portal</h1>
+          <p>Physician review queue with linked patient charts, signed notes, addenda, and delivery tracking.</p>
         </div>
 
-        <p><a href="/">← Back to patient list</a> | <a href="/logout">Log out</a></p>
+        <p><a href="/logout">Log out</a></p>
 
-        <div class="tabs">
-          {tab_link("demographics", "Demographics & Pharmacy")}
-          {tab_link("pmh", "Medical History")}
-          {tab_link("social", "Social History")}
-          {tab_link("medications", "Medications")}
-          {tab_link("encounters", "Encounters")}
-        </div>
-
-        <div class="layout">
-          <div class="card sidebar">
-            <h3 style="margin-top:0;">Encounters</h3>
-            {encounter_tab_html}
-          </div>
-          <div class="grid">
-            {panel_html}
-          </div>
+        <div class="card list-card">
+          <table>
+            <thead>
+              <tr>
+                <th>Patient</th>
+                <th>Chart #</th>
+                <th>Encounters</th>
+                <th>Latest Chief Complaint</th>
+                <th>Status</th>
+                <th>Prescription</th>
+              </tr>
+            </thead>
+            <tbody>
+              {''.join(rows)}
+            </tbody>
+          </table>
         </div>
         """,
     )
