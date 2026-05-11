@@ -230,6 +230,10 @@ def render_pharmacy(ph: Optional[Dict[str, Any]]) -> str:
 
 
 def extract_encounter_label(note_text: str, fallback: str) -> str:
+    saved_chief_complaint = safe_str(fallback).strip()
+    if saved_chief_complaint:
+        return saved_chief_complaint
+
     text = safe_str(note_text)
     lower_text = text.lower()
     marker = "the working diagnosis is "
