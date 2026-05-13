@@ -418,38 +418,10 @@ def render_pharmacy(ph: Dict[str, Any]) -> str:
 
 
 def encounter_topic(chief_complaint: str) -> str:
-    text = safe_str(chief_complaint).lower()
-    if not text:
-        return "encounter"
-
-    patterns = [
-        (r"abdominal pain|stomach pain|belly pain", "abdominal pain"),
-        (r"rash|red swollen|crust", "rash"),
-        (r"sore throat", "sore throat"),
-        (r"cough", "cough"),
-        (r"headache|migraine", "headache"),
-        (r"ear pain|earache", "ear pain"),
-        (r"back pain", "back pain"),
-        (r"uti|urinary|burning with urination|dysuria", "urinary symptoms"),
-        (r"sinus", "sinus symptoms"),
-        (r"nausea|vomiting", "nausea/vomiting"),
-        (r"diarrhea", "diarrhea"),
-        (r"constipation", "constipation"),
-        (r"tooth|dental", "tooth pain"),
-        (r"anxiety|panic", "anxiety"),
-        (r"insomnia|sleep", "insomnia"),
-        (r"eye|red eye", "eye problem"),
-        (r"asthma|wheeze|shortness of breath", "breathing problem"),
-    ]
-
-    for pattern, label in patterns:
-        if re.search(pattern, text):
-            return label
-
-    words = re.findall(r"[a-zA-Z]+", text)
-    if not words:
-        return "encounter"
-    return " ".join(words[:4])
+    text = safe_str(chief_complaint).strip()
+    if text:
+        return text
+    return "Encounter"
 
 
 def encounter_when(started: str, created: str) -> str:
