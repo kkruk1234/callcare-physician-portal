@@ -2736,15 +2736,13 @@ async def patient_chart(
 async def update_note(packet_id: str, request: Request, note_text: str = Form(...), chief_complaint: str = Form(default="")) -> RedirectResponse:
     require_session(request)
 
-    row = query_one("SELECT chart_number, signed, call_sid, patient_id FROM callcare.portal_packets WHERE packet_id = %s LIMIT 1;", (packet_id,))
+    row = query_one("SELECT chart_number, signed FROM callcare.portal_packets WHERE packet_id = %s LIMIT 1;", (packet_id,))
     if not row:
         raise HTTPException(status_code=404, detail="Packet not found")
     if row.get("signed"):
         raise HTTPException(status_code=400, detail="Signed notes are read-only")
 
     chart_number = safe_str(row.get("chart_number"))
-    cleaned_chief_complaint = safe_str(chief_complaint)
-
     execute(
         """
         UPDATE callcare.portal_packets
@@ -2754,34 +2752,8 @@ async def update_note(packet_id: str, request: Request, note_text: str = Form(..
           updated_at = now()
         WHERE packet_id = %s;
         """,
-        (safe_str(note_text), cleaned_chief_complaint, packet_id),
+        (safe_str(note_text), safe_str(chief_complaint), packet_id),
     )
-
-    call_sid = safe_str(row.get("call_sid"))
-    patient_id = safe_str(row.get("patient_id"))
-    if call_sid:
-        execute(
-            """
-            UPDATE callcare.encounters
-            SET chief_complaint = NULLIF(%s, '')
-            WHERE call_sid = %s;
-            """,
-            (cleaned_chief_complaint, call_sid),
-        )
-    elif patient_id:
-        execute(
-            """
-            UPDATE callcare.encounters
-            SET chief_complaint = NULLIF(%s, '')
-            WHERE patient_id::text = %s
-              AND started_at = (
-                SELECT MAX(started_at)
-                FROM callcare.encounters
-                WHERE patient_id::text = %s
-              );
-            """,
-            (cleaned_chief_complaint, patient_id, patient_id),
-        )
     return RedirectResponse(url=f"/patient/{chart_number}?packet_id={packet_id}&tab=encounters", status_code=303)
 
 
