@@ -723,13 +723,16 @@ def shell(title: str, body: str) -> str:
             const noteKey = "callcare_note_draft_" + packetId;
             const summaryKey = "callcare_summary_draft_" + packetId;
 
+            let noteForm = null;
+            let summaryForm = null;
+
             if (note) {{
               const savedNote = localStorage.getItem(noteKey);
               if (savedNote !== null) note.value = savedNote;
               note.addEventListener("input", function() {{
                 localStorage.setItem(noteKey, note.value);
               }});
-              const noteForm = note.closest("form");
+              noteForm = note.closest("form");
               if (noteForm) {{
                 noteForm.addEventListener("submit", function() {{
                   localStorage.removeItem(noteKey);
@@ -743,13 +746,56 @@ def shell(title: str, body: str) -> str:
               summary.addEventListener("input", function() {{
                 localStorage.setItem(summaryKey, summary.value);
               }});
-              const summaryForm = summary.closest("form");
+              summaryForm = summary.closest("form");
               if (summaryForm) {{
                 summaryForm.addEventListener("submit", function() {{
                   localStorage.removeItem(summaryKey);
                 }});
               }}
             }}
+
+            async function saveUnsavedEncounterText() {{
+              if (note && localStorage.getItem(noteKey) !== null) {{
+                const fd = new FormData();
+                const cc = noteForm ? noteForm.querySelector("input[name='chief_complaint']") : null;
+                fd.append("note_text", note.value || "");
+                fd.append("chief_complaint", cc ? cc.value : "");
+                const resp = await fetch("/packet/" + encodeURIComponent(packetId) + "/update-note", {{
+                  method: "POST",
+                  body: fd,
+                  credentials: "same-origin"
+                }});
+                if (!resp.ok) throw new Error("Could not save note changes.");
+                localStorage.removeItem(noteKey);
+              }}
+
+              if (summary && localStorage.getItem(summaryKey) !== null) {{
+                const fd = new FormData();
+                fd.append("spoken_summary_comments", summary.value || "");
+                const resp = await fetch("/packet/" + encodeURIComponent(packetId) + "/update-spoken-summary-comments", {{
+                  method: "POST",
+                  body: fd,
+                  credentials: "same-origin"
+                }});
+                if (!resp.ok) throw new Error("Could not save spoken summary comments.");
+                localStorage.removeItem(summaryKey);
+              }}
+            }}
+
+            document.querySelectorAll("form").forEach(function(form) {{
+              if (form === noteForm || form === summaryForm) return;
+              form.addEventListener("submit", async function(event) {{
+                if (form.dataset.callcareAutosaving === "1") return;
+                event.preventDefault();
+                try {{
+                  await saveUnsavedEncounterText();
+                  form.dataset.callcareAutosaving = "1";
+                  form.submit();
+                }} catch (err) {{
+                  alert(err && err.message ? err.message : "Could not save unsaved encounter text before continuing.");
+                }}
+              }});
+            }});
           }})();
         </script>
       </body>
