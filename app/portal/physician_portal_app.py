@@ -24,6 +24,41 @@ CALLCARE_PHYSICIAN_PASSWORD = os.getenv("CALLCARE_PHYSICIAN_PASSWORD", "").strip
 
 SESSIONS: Dict[str, Dict[str, str]] = {}
 
+# Presentation encounter fallback:
+# The live Render database currently stores the physician-facing encounter,
+# but the existing portal_packets row does not include the original evidence
+# array from the local ReviewPacket. This fallback restores the four sources
+# for the already-recorded thesis-defense encounter without changing any
+# clinical, signing, prescription, addendum, email, or patient-record logic.
+PRESENTATION_EVIDENCE_BY_PACKET: Dict[str, List[Dict[str, str]]] = {
+    "4ada1b5a-53e2-4d20-b979-6feb0645887a": [
+        {
+            "title": "Streptococcal Pharyngitis: Rapid Evidence Review | AFP",
+            "source": "aafp.org",
+            "url": "https://www.aafp.org/afp/2024/0400/streptococcal-pharyngitis",
+            "accessed": "2026-07-16",
+        },
+        {
+            "title": "Sore throat in adults - Mayo Clinic",
+            "source": "mayoclinic.org",
+            "url": "https://www.mayoclinic.org/symptom-checker/sore-throat-in-adults-adult/related-factors/itt-20009075",
+            "accessed": "2026-07-16",
+        },
+        {
+            "title": "Clinical Guidance for Group A Streptococcal Pharyngitis | Group A Strep | CDC",
+            "source": "cdc.gov",
+            "url": "https://www.cdc.gov/group-a-strep/hcp/clinical-guidance/strep-throat.html",
+            "accessed": "2026-07-16",
+        },
+        {
+            "title": "Diagnosis and Management of Group A Streptococcal Pharyngitis | AFP",
+            "source": "aafp.org",
+            "url": "https://www.aafp.org/afp/2003/0215/p880",
+            "accessed": "2026-07-16",
+        },
+    ]
+}
+
 
 def safe_str(x: Any) -> str:
     try:
@@ -422,7 +457,8 @@ def get_encounters(chart_number: str) -> List[Dict[str, Any]]:
       signed,
       signed_at::text AS signed_at,
       signed_by,
-      COALESCE(addenda, '[]'::jsonb) AS addenda
+      COALESCE(addenda, '[]'::jsonb) AS addenda,
+      to_jsonb(callcare.portal_packets)->'evidence' AS evidence
     FROM callcare.portal_packets
     WHERE chart_number = %s
     ORDER BY created_at DESC;
@@ -439,6 +475,14 @@ def get_encounters(chart_number: str) -> List[Dict[str, Any]]:
                     "packet_id": safe_str(row.get("packet_id")),
                     "note_text": safe_str(row.get("note_text")),
                     "created_at": safe_str(row.get("created_at")),
+                    "evidence": (
+                        row.get("evidence")
+                        if isinstance(row.get("evidence"), list)
+                        else PRESENTATION_EVIDENCE_BY_PACKET.get(
+                            safe_str(row.get("packet_id")),
+                            [],
+                        )
+                    ),
                 },
                 "meta": {
                     "signed": bool(row.get("signed")),
@@ -2668,6 +2712,41 @@ async def patient_chart(
         """
     )
 
+    selected_evidence = selected_packet.get("evidence") or []
+    evidence_lines: List[str] = []
+
+    for index, item in enumerate(selected_evidence, 1):
+        if not isinstance(item, dict):
+            continue
+
+        title = safe_str(item.get("title"))
+        source = safe_str(item.get("source"))
+        accessed = safe_str(item.get("accessed"))
+        url = safe_str(item.get("url"))
+
+        details = []
+        if source:
+            details.append(source)
+        if accessed:
+            details.append(f"Accessed {accessed}")
+
+        line_parts = [f"{index}. {title or 'Untitled source'}"]
+        if details:
+            line_parts.append(" — ".join(details))
+        if url:
+            line_parts.append(url)
+
+        evidence_lines.append("\n".join(line_parts))
+
+    evidence_text = "\n\n".join(evidence_lines) if evidence_lines else "No evidence attached."
+
+    evidence_panel_html = f"""
+      <div class="card">
+        <h2 class="section-title">Evidence Used</h2>
+        <div class="readonly">{html_escape(evidence_text)}</div>
+      </div>
+    """
+
     clinical_note_panel = (
         f"""
         <form method="post" action="/packet/{html_escape(selected_packet_id)}/update-note">
@@ -2728,6 +2807,7 @@ async def patient_chart(
         {summary_editor}
       </div>
 
+      {evidence_panel_html}
       {addenda_html}
       {addendum_editor_html}
       {physician_actions}
