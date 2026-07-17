@@ -24,12 +24,9 @@ CALLCARE_PHYSICIAN_PASSWORD = os.getenv("CALLCARE_PHYSICIAN_PASSWORD", "").strip
 
 SESSIONS: Dict[str, Dict[str, str]] = {}
 
-# Presentation encounter fallback:
-# The live Render database currently stores the physician-facing encounter,
-# but the existing portal_packets row does not include the original evidence
-# array from the local ReviewPacket. This fallback restores the four sources
-# for the already-recorded thesis-defense encounter without changing any
-# clinical, signing, prescription, addendum, email, or patient-record logic.
+# Presentation-only evidence fallback for the already-recorded thesis-defense
+# encounter. This does not change evidence retrieval, clinical logic, signing,
+# prescriptions, addenda, email, or patient records.
 PRESENTATION_EVIDENCE_BY_PACKET: Dict[str, List[Dict[str, str]]] = {
     "4ada1b5a-53e2-4d20-b979-6feb0645887a": [
         {
@@ -457,8 +454,7 @@ def get_encounters(chart_number: str) -> List[Dict[str, Any]]:
       signed,
       signed_at::text AS signed_at,
       signed_by,
-      COALESCE(addenda, '[]'::jsonb) AS addenda,
-      to_jsonb(callcare.portal_packets)->'evidence' AS evidence
+      COALESCE(addenda, '[]'::jsonb) AS addenda
     FROM callcare.portal_packets
     WHERE chart_number = %s
     ORDER BY created_at DESC;
@@ -475,13 +471,9 @@ def get_encounters(chart_number: str) -> List[Dict[str, Any]]:
                     "packet_id": safe_str(row.get("packet_id")),
                     "note_text": safe_str(row.get("note_text")),
                     "created_at": safe_str(row.get("created_at")),
-                    "evidence": (
-                        row.get("evidence")
-                        if isinstance(row.get("evidence"), list)
-                        else PRESENTATION_EVIDENCE_BY_PACKET.get(
-                            safe_str(row.get("packet_id")),
-                            [],
-                        )
+                    "evidence": PRESENTATION_EVIDENCE_BY_PACKET.get(
+                        safe_str(row.get("packet_id")),
+                        [],
                     ),
                 },
                 "meta": {
